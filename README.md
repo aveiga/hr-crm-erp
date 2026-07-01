@@ -19,7 +19,7 @@ data segregation.
 | Cache     | Redis 7 (optional)                                             |
 | Documents | LibreOffice (headless) DOCX → PDF                              |
 | Dev       | Devcontainer (app + Postgres + Redis)                          |
-| CI/CD     | GitHub Actions → public images on GHCR                         |
+| CI/CD     | GitHub Actions → public images on GHCR + Docker Hub            |
 
 ## Design highlights
 
@@ -154,18 +154,28 @@ devcontainer); DOCX works anywhere. See the `document-templates` skill.
 ## Deployment & images
 
 On merge to `main`, GitHub Actions (`.github/workflows/release.yml`) builds and
-pushes:
+pushes `-backend` and `-frontend` images to **both** GHCR and Docker Hub:
 
-- `ghcr.io/<owner>/<repo>-backend`
-- `ghcr.io/<owner>/<repo>-frontend`
+- `ghcr.io/<owner>/<repo>-{backend,frontend}`
+- `docker.io/<dockerhub-user>/<repo>-{backend,frontend}`
 
-tagged `latest`, the short SHA, and semver on `v*` tags. **After the first
-push, mark both GHCR packages Public** (package → Settings → Change visibility);
-this is a one-time GitHub setting. Set the repo variable
-`NEXT_PUBLIC_API_URL` so the frontend image points at your API.
+tagged `latest`, the short SHA, and semver on `v*` tags. Docker Hub publishing
+needs two repo secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Read &
+Write access token). **After the first push, mark both GHCR packages Public**
+(package → Settings → Change visibility); this is a one-time GitHub setting.
 
-Required production env: `DATABASE_URL`, `JWT_SECRET` (mandatory),
-`CORS_ORIGIN`, and `REDIS_URL` (optional). See `.env.example`.
+The frontend image is **portable**: the browser API base URL is resolved at
+runtime — set the `API_URL` env var on the frontend container to your backend's
+public URL (injected into the page by `frontend/app/layout.tsx`), so the same
+image runs in any environment without a rebuild.
+
+Required production env:
+
+- **Backend**: `DATABASE_URL`, `JWT_SECRET` (mandatory), `CORS_ORIGIN` (must
+  match the frontend's public origin), `REDIS_URL` (optional).
+- **Frontend**: `API_URL` (the backend's public URL).
+
+See `.env.example`.
 
 ## AI skills for maintenance
 

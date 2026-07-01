@@ -65,5 +65,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+          # The frontend API URL is configured at runtime via the API_URL env
+          # var on the container (see app/layout.tsx), not baked at build time.
