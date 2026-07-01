@@ -2,7 +2,7 @@ package resource
 
 // Picklists carried over from the workbook's 01_Setup sheet.
 var (
-	leadStatus    = []string{"New", "Contacted", "Qualified", "Unqualified"}
+	leadStatus    = []string{"New", "Contacted", "Qualified", "Unqualified", "Converted"}
 	oppStage      = []string{"Prospecting", "Discovery", "Proposal", "Negotiation", "Won", "Lost"}
 	activityType  = []string{"Call", "Email", "Meeting", "Task"}
 	activityStat  = []string{"Open", "Completed", "Cancelled"}
@@ -149,7 +149,8 @@ func Catalog() []Entity {
 			Group: "CRM", TitleField: "company", Icon: "target",
 			Fields: []Field{
 				req(txt("company", "Company")),
-				txt("contact_name", "Contact Name"),
+				txt("contact_first_name", "Contact First Name"),
+				req(txt("contact_last_name", "Contact Last Name")),
 				email("email", "Email"),
 				txt("phone", "Phone"),
 				sel("source", "Source", leadSource...),
@@ -159,6 +160,10 @@ func Catalog() []Entity {
 				date("created_date", "Created Date"),
 				date("next_action_date", "Next Action Date"),
 				long("notes", "Notes"),
+				// Set when the lead is converted (Convert to Opportunity); links
+				// back to the created Account/Opportunity and blocks re-conversion.
+				ro(hidden(ref("converted_account_id", "Converted Account", "accounts", "account_name"))),
+				ro(hidden(ref("converted_opportunity_id", "Converted Opportunity", "opportunities", "opportunity_name"))),
 			},
 		},
 		{

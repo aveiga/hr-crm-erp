@@ -176,7 +176,17 @@ export default function RecordPage({
   }
 
   const convertLabel =
-    entityKey === "quotes" ? "Convert to Sales Order" : entityKey === "sales_orders" ? "Convert to Invoice" : "";
+    entityKey === "leads"
+      ? "Convert to Opportunity"
+      : entityKey === "opportunities"
+        ? "Create Quote"
+        : entityKey === "quotes"
+          ? "Convert to Sales Order"
+          : entityKey === "sales_orders"
+            ? "Convert to Invoice"
+            : "";
+  // A lead converts into the funnel exactly once.
+  const alreadyConverted = entityKey === "leads" && !!values.converted_opportunity_id;
 
   return (
     <div className="max-w-4xl space-y-4">
@@ -188,7 +198,7 @@ export default function RecordPage({
           <h1 className="text-2xl font-bold">{title}</h1>
         </div>
         <div className="flex gap-2">
-          {!isNew && editable && convertLabel && (
+          {!isNew && editable && convertLabel && !alreadyConverted && (
             <button type="button" className="btn-secondary" onClick={convert} disabled={converting}>
               <Icon name="arrow-right-left" className="h-4 w-4" />
               {converting ? "Converting…" : convertLabel}

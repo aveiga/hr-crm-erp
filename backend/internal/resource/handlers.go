@@ -283,7 +283,8 @@ func (h *Handlers) DocGet(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"data": row, "lines": lines})
 }
 
-// POST /api/v1/docs/{entity}/{id}/convert  -> quote→order or order→invoice.
+// POST /api/v1/docs/{entity}/{id}/convert  -> advance a record to the next
+// pipeline stage (lead→opportunity, opportunity→quote, quote→order→invoice).
 func (h *Handlers) DocConvert(w http.ResponseWriter, r *http.Request) {
 	e, p, ok := h.resolve(w, r)
 	if !ok {
@@ -294,7 +295,7 @@ func (h *Handlers) DocConvert(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, httpx.ErrNotFound)
 		return
 	}
-	toKey, row, err := h.docs.Convert(r.Context(), e.Key, p.TenantID, id)
+	toKey, row, err := h.docs.Convert(r.Context(), p, e.Key, p.TenantID, id)
 	if err != nil {
 		httpx.Fail(w, err)
 		return

@@ -173,6 +173,160 @@ func TestConvertQuoteToOrderToInvoice(t *testing.T) {
 	}
 }
 
+func TestConvertLeadToOpportunity(t *testing.T) {
+	token, _ := signup(t, "Lead Convert Co")
+	lead := do(t, "POST", "/api/v1/entities/leads", token, map[string]any{
+		"company": "Acme Corp", "contact_first_name": "Jane", "contact_last_name": "Doe", "email": "jane@acme.test",
+		"country": "PT", "status": "Qualified", "owner": "Rep One",
+	})
+	leadID := dataObj(t, lead)["id"].(string)
+
+	res := do(t, "POST", "/api/v1/docs/leads/"+leadID+"/convert", token, nil)
+	if res.Status != http.StatusCreated || res.Body["entity"] != "opportunities" {
+		t.Fatalf("convert lead failed: %d %s", res.Status, res.Raw)
+	}
+	opp := dataObj(t, res)
+	accountID, _ := opp["account_id"].(string)
+	if accountID == "" {
+		t.Fatalf("opportunity should link to a created account: %v", opp)
+	}
+
+	// The account was created, carrying the lead's contact as a child row.
+	accGet := do(t, "GET", "/api/v1/docs/accounts/"+accountID, token, nil)
+	accData, _ := accGet.Body["data"].(map[string]any)
+	if accData["account_name"] != "Acme Corp" {
+		t.Fatalf("account name not set from lead: %s", accGet.Raw)
+	}
+	lines, _ := accGet.Body["lines"].([]any)
+	if len(lines) != 1 {
+		t.Fatalf("account should have 1 contact from the lead, got %s", accGet.Raw)
+	}
+	contact, _ := lines[0].(map[string]any)
+	if contact["first_name"] != "Jane" || contact["last_name"] != "Doe" {
+		t.Fatalf("contact name not split onto first/last: %v", contact)
+	}
+
+	// The lead is stamped Converted, linked to what it became, and can't be
+	// funneled a second time.
+	leadGet := do(t, "GET", "/api/v1/entities/leads/"+leadID, token, nil)
+	ld := dataObj(t, leadGet)
+	if ld["status"] != "Converted" {
+		t.Fatalf("lead not marked converted: %s", leadGet.Raw)
+	}
+	if ld["converted_opportunity_id"] != opp["id"] {
+		t.Fatalf("lead not linked to its opportunity: %v", ld["converted_opportunity_id"])
+	}
+	again := do(t, "POST", "/api/v1/docs/leads/"+leadID+"/convert", token, nil)
+	if again.Status != http.StatusConflict {
+		t.Fatalf("re-converting a lead should be rejected, got %d %s", again.Status, again.Raw)
+	}
+}
+
+func TestConvertLeadReusesExistingAccount(t *testing.T) {
+	token, _ := signup(t, "Lead Reuse Co")
+	// A pre-existing account with one contact already on file.
+	acc := do(t, "POST", "/api/v1/docs/accounts", token, map[string]any{
+		"account_name": "Globex",
+		"lines": []map[string]any{
+			{"last_name": "Existing Person", "email": "existing@globex.test"},
+		},
+	})
+	accID := dataObj(t, acc)["id"].(string)
+
+	// A lead for the same company (different case) with a new contact.
+	lead := do(t, "POST", "/api/v1/entities/leads", token, map[string]any{
+		"company": "globex", "contact_first_name": "New", "contact_last_name": "Person", "email": "new@globex.test",
+		"status": "Qualified",
+	})
+	leadID := dataObj(t, lead)["id"].(string)
+	res := do(t, "POST", "/api/v1/docs/leads/"+leadID+"/convert", token, nil)
+	if res.Status != http.StatusCreated {
+		t.Fatalf("convert failed: %d %s", res.Status, res.Raw)
+	}
+	opp := dataObj(t, res)
+	if opp["account_id"] != accID {
+		t.Fatalf("should reuse the existing account %s, got %v", accID, opp["account_id"])
+	}
+
+	// The new contact is merged in alongside the existing one (2 total). A
+	// second lead for the same person must not create a duplicate contact.
+	accGet := do(t, "GET", "/api/v1/docs/accounts/"+accID, token, nil)
+	if lines, _ := accGet.Body["lines"].([]any); len(lines) != 2 {
+		t.Fatalf("account should have 2 merged contacts, got %s", accGet.Raw)
+	}
+
+	dup := do(t, "POST", "/api/v1/entities/leads", token, map[string]any{
+		"company": "Globex", "contact_first_name": "New", "contact_last_name": "Person", "email": "new@globex.test",
+		"status": "Qualified",
+	})
+	dupID := dataObj(t, dup)["id"].(string)
+	if r := do(t, "POST", "/api/v1/docs/leads/"+dupID+"/convert", token, nil); r.Status != http.StatusCreated {
+		t.Fatalf("second convert failed: %d %s", r.Status, r.Raw)
+	}
+	accGet2 := do(t, "GET", "/api/v1/docs/accounts/"+accID, token, nil)
+	if lines, _ := accGet2.Body["lines"].([]any); len(lines) != 2 {
+		t.Fatalf("duplicate contact should not be added, want 2 got %s", accGet2.Raw)
+	}
+}
+
+func TestConvertOpportunityToQuoteSyncsAmount(t *testing.T) {
+	token, _ := signup(t, "Opp Convert Co")
+	le := do(t, "POST", "/api/v1/entities/legal_entities", token, map[string]any{
+		"legal_name": "Seller Ltd", "billing_address": "HQ Street 1",
+	})
+	leID := dataObj(t, le)["id"].(string)
+	acc := do(t, "POST", "/api/v1/docs/accounts", token, map[string]any{
+		"account_name": "Big Buyer", "legal_entity_id": leID,
+	})
+	accID := dataObj(t, acc)["id"].(string)
+	opp := do(t, "POST", "/api/v1/entities/opportunities", token, map[string]any{
+		"account_id": accID, "opportunity_name": "Platform Deal",
+		"stage": "Proposal", "probability_pct": 50,
+	})
+	oppID := dataObj(t, opp)["id"].(string)
+
+	// Opportunity -> Quote: pre-filled with the account and its billing entity.
+	res := do(t, "POST", "/api/v1/docs/opportunities/"+oppID+"/convert", token, nil)
+	if res.Status != http.StatusCreated || res.Body["entity"] != "quotes" {
+		t.Fatalf("convert opportunity failed: %d %s", res.Status, res.Raw)
+	}
+	quote := dataObj(t, res)
+	quoteID := quote["id"].(string)
+	if quote["account_id"] != accID {
+		t.Fatalf("quote should carry the account: %v", quote["account_id"])
+	}
+	if quote["opportunity_id"] != oppID {
+		t.Fatalf("quote should reference the opportunity: %v", quote["opportunity_id"])
+	}
+	if quote["legal_entity_id"] != leID {
+		t.Fatalf("quote legal entity should default from the account: %v", quote["legal_entity_id"])
+	}
+	if quote["description"] != "Platform Deal" {
+		t.Fatalf("quote description not set from opportunity: %v", quote["description"])
+	}
+
+	// Add lines to the quote; its net total flows back onto the opportunity as
+	// amount (net) and probability-weighted value.
+	upd := do(t, "PUT", "/api/v1/docs/quotes/"+quoteID, token, map[string]any{
+		"account_id": accID, "opportunity_id": oppID, "description": "Platform Deal",
+		"lines": []map[string]any{
+			{"sku": "SVC", "description": "Build", "qty": 4, "unit_price": 250},
+		},
+	})
+	if upd.Status != http.StatusOK {
+		t.Fatalf("quote update failed: %d %s", upd.Status, upd.Raw)
+	}
+
+	oppGet := do(t, "GET", "/api/v1/entities/opportunities/"+oppID, token, nil)
+	od := dataObj(t, oppGet)
+	if got := numField(t, od, "amount_net"); got != 1000 {
+		t.Fatalf("opportunity amount_net want 1000, got %v", got)
+	}
+	if got := numField(t, od, "weighted_amount"); got != 500 {
+		t.Fatalf("opportunity weighted_amount want 500 (50%%), got %v", got)
+	}
+}
+
 func TestDocEndpointsRejectNonDocument(t *testing.T) {
 	token, _ := signup(t, "NonDoc Co")
 	// leads has no child collection, so the document endpoints must reject it.
