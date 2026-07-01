@@ -1,0 +1,11 @@
+**/node_modules
+**/.next
+frontend/out
+**/*.test
+.git
+.github
+*.md
+Offers
+IGTR
+.env*
+**/.DS_Store

@@ -1,0 +1,28 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# Go
+/backend/bin/
+*.test
+*.out
+
+# Env / secrets
+.env
+.env.local
+*.local
+
+# Generated documents / scratch
+/Offers/
+/IGTR/
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp
+
+# Original Excel sources (keep templates/, ignore working copies)
+*.xlsm~

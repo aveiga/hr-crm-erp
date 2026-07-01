@@ -1,0 +1,46 @@
+# Development services for the devcontainer. The "app" container is where you
+# code; Postgres and Redis back it.
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/base:bookworm
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/hr-crm-erp:cached
+    environment:
+      DATABASE_URL: postgres://hrcrm:hrcrm@db:5432/hrcrm?sslmode=disable
+      TEST_DATABASE_URL: postgres://hrcrm:hrcrm@db:5432/hrcrm_test?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGIN: http://localhost:3000
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hrcrm
+      POSTGRES_PASSWORD: hrcrm
+      POSTGRES_DB: hrcrm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hrcrm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

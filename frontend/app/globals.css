@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-50 text-slate-800 antialiased;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-brand-600 text-white hover:bg-brand-700;
+  }
+  .btn-secondary {
+    @apply btn bg-white text-slate-700 border border-slate-300 hover:bg-slate-50;
+  }
+  .btn-danger {
+    @apply btn bg-red-600 text-white hover:bg-red-700;
+  }
+  .input {
+    @apply w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500;
+  }
+  .select {
+    @apply input appearance-none bg-no-repeat pr-9;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2364748b' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-position: right 0.6rem center;
+    background-size: 1rem 1rem;
+  }
+  .checkbox {
+    @apply h-4 w-4 shrink-0 cursor-pointer appearance-none rounded border border-slate-300 bg-white transition-colors;
+    @apply checked:border-brand-600 checked:bg-brand-600;
+    @apply focus:outline-none focus:ring-1 focus:ring-brand-500;
+    @apply disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .checkbox:checked {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%23ffffff' stroke-width='3'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M5 13l4 4L19 7'/%3E%3C/svg%3E");
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: 0.7rem 0.7rem;
+  }
+  .label {
+    @apply block text-sm font-medium text-slate-700 mb-1;
+  }
+  .card {
+    @apply rounded-lg border border-slate-200 bg-white shadow-sm;
+  }
+}

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hrcrm
+          POSTGRES_PASSWORD: hrcrm
+          POSTGRES_DB: hrcrm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hrcrm"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://hrcrm:hrcrm@localhost:5432/hrcrm_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Vet
+        working-directory: backend
+        run: go vet ./...
+      - name: Test
+        working-directory: backend
+        run: go test -count=1 ./...
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Typecheck
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8080

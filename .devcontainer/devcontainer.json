@@ -1,0 +1,31 @@
+{
+  "name": "hr-crm-erp",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/hr-crm-erp",
+  "features": {
+    "ghcr.io/devcontainers/features/go:1": { "version": "1.26" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "forwardPorts": [3000, 8080, 5432, 6379],
+  "portsAttributes": {
+    "3000": { "label": "Frontend" },
+    "8080": { "label": "Backend API" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "bradlc.vscode-tailwindcss",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "go.toolsManagement.autoUpdate": true
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}

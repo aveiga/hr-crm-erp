@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(file *)",
+      "Read(//private/tmp/xlsx_dump/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(go version *)",
+      "Bash(echo \"go: $\\(go version 2>&1\\)\")",
+      "Bash(npm -v)",
+      "Bash(echo \"npm: $\\(npm -v 2>&1\\)\")",
+      "Bash(docker --version)",
+      "Bash(libreoffice --version)",
+      "Bash(go mod *)",
+      "Bash(go build *)",
+      "Bash(echo \"BUILD_EXIT=$?\")"
+    ]
+  }
+}
