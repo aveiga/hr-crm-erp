@@ -49,8 +49,10 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    environment:
+      # Resolved at runtime and injected into the browser (see app/layout.tsx),
+      # so the image is portable across environments.
+      API_URL: ${API_URL:-http://localhost:8080}
     ports:
       - "3000:3000"
     depends_on:

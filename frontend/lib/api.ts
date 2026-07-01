@@ -2,8 +2,23 @@
 // localStorage so the whole app is a static SPA the backend can serve.
 import type { AuthPayload, Entity, ListResult, Record as Row } from "./types";
 
-const BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+declare global {
+  interface Window {
+    __ENV__?: { apiUrl?: string };
+  }
+}
+
+// Resolved at runtime from the server-injected window.__ENV__ (see the root
+// layout) so a single build runs in any environment. Falls back to the
+// build-time NEXT_PUBLIC var (handy for `next dev`), then localhost.
+function resolveBase(): string {
+  if (typeof window !== "undefined" && window.__ENV__?.apiUrl) {
+    return window.__ENV__.apiUrl;
+  }
+  return process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+}
+
+const BASE = resolveBase();
 
 const TOKEN_KEY = "hrcrm_token";
 

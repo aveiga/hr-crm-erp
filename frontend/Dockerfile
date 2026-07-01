@@ -12,9 +12,6 @@ FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-# API URL is baked at build time for the browser bundle; override via build-arg.
-ARG NEXT_PUBLIC_API_URL=http://localhost:8080
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
@@ -31,5 +28,7 @@ COPY --from=build /app/.next/static ./.next/static
 
 USER appuser
 EXPOSE 3000
-ENV PORT=3000 HOSTNAME=0.0.0.0
+# API_URL is read at runtime and injected into the browser (see app/layout.tsx),
+# so this image is portable — set API_URL per deployment.
+ENV PORT=3000 HOSTNAME=0.0.0.0 API_URL=http://localhost:8080
 CMD ["node", "server.js"]
