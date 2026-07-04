@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"hrcrm/internal/httpx"
@@ -306,6 +307,128 @@ func (h *Handlers) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.respondAuth(w, u, t, role)
+}
+
+// tokenBlockedForAPI rejects token management when the caller authenticated
+// with an API token, so a token can't be used to mint or revoke tokens (and
+// thus escalate its own privileges). Returns true if the request was blocked.
+func (h *Handlers) tokenBlockedForAPI(w http.ResponseWriter, p httpx.Principal) bool {
+	if p.IsAPIToken {
+		httpx.Fail(w, httpx.Errorf(http.StatusForbidden, "forbidden",
+			"API tokens cannot manage tokens; sign in interactively"))
+		return true
+	}
+	return false
+}
+
+// POST /api/v1/tokens -> mint a per-agent API token for the caller's active
+// membership. The plaintext token is returned exactly once.
+func (h *Handlers) CreateToken(w http.ResponseWriter, r *http.Request) {
+	p, _ := httpx.MustPrincipal(r)
+	if h.tokenBlockedForAPI(w, p) {
+		return
+	}
+	var req struct {
+		Name          string `json:"name"`
+		ReadOnly      bool   `json:"read_only"`
+		ExpiresInDays int    `json:"expires_in_days"`
+	}
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "validation", "name is required"))
+		return
+	}
+	var expiresAt *time.Time
+	if req.ExpiresInDays > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresInDays) * 24 * time.Hour)
+		expiresAt = &t
+	}
+	plaintext, hash := NewAPIToken()
+	tok, err := h.store.CreateAPIToken(r.Context(), p.TenantID, p.UserID, req.Name, req.ReadOnly, expiresAt, hash)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{
+		"id":         tok.ID,
+		"name":       tok.Name,
+		"read_only":  tok.ReadOnly,
+		"created_at": tok.CreatedAt,
+		"expires_at": tok.ExpiresAt,
+		// Shown once — the server only ever stores the hash.
+		"token": plaintext,
+	})
+}
+
+// GET /api/v1/tokens -> the caller's active tokens (metadata only, no secrets).
+func (h *Handlers) ListTokens(w http.ResponseWriter, r *http.Request) {
+	p, _ := httpx.MustPrincipal(r)
+	toks, err := h.store.ListAPITokens(r.Context(), p.TenantID, p.UserID)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": toks})
+}
+
+// DELETE /api/v1/tokens/{id} -> revoke one of the caller's tokens.
+func (h *Handlers) RevokeToken(w http.ResponseWriter, r *http.Request) {
+	p, _ := httpx.MustPrincipal(r)
+	if h.tokenBlockedForAPI(w, p) {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Fail(w, httpx.ErrNotFound)
+		return
+	}
+	if err := h.store.RevokeAPIToken(r.Context(), p.TenantID, p.UserID, id); err != nil {
+		if errors.Is(err, ErrTokenNotFound) {
+			httpx.Fail(w, httpx.ErrNotFound)
+			return
+		}
+		httpx.Fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GET /api/v1/team/tokens (admin) -> every active token in the tenant, with
+// owner details.
+func (h *Handlers) ListAllTokens(w http.ResponseWriter, r *http.Request) {
+	p, _ := httpx.MustPrincipal(r)
+	toks, err := h.store.ListTenantTokens(r.Context(), p.TenantID)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": toks})
+}
+
+// DELETE /api/v1/team/tokens/{id} (admin) -> revoke any token in the tenant.
+func (h *Handlers) RevokeAnyToken(w http.ResponseWriter, r *http.Request) {
+	p, _ := httpx.MustPrincipal(r)
+	if h.tokenBlockedForAPI(w, p) {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Fail(w, httpx.ErrNotFound)
+		return
+	}
+	if err := h.store.RevokeTenantToken(r.Context(), p.TenantID, id); err != nil {
+		if errors.Is(err, ErrTokenNotFound) {
+			httpx.Fail(w, httpx.ErrNotFound)
+			return
+		}
+		httpx.Fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) respondAuth(w http.ResponseWriter, u User, t Tenant, role string) {

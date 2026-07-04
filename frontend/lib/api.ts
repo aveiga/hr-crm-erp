@@ -121,6 +121,15 @@ export const api = {
   setPermissions: (user_id: string, groups: string[] | null) =>
     request<{ ok: boolean }>("PUT", "/api/v1/team/permissions", { user_id, groups }),
 
+  // Per-agent API tokens. A member manages their own; admins additionally see
+  // and revoke every token in the tenant.
+  tokens: () => request<{ tokens: ApiToken[] }>("GET", "/api/v1/tokens"),
+  createToken: (b: { name: string; read_only?: boolean; expires_in_days?: number }) =>
+    request<ApiTokenCreated>("POST", "/api/v1/tokens", b),
+  revokeToken: (id: string) => request<void>("DELETE", `/api/v1/tokens/${id}`),
+  teamTokens: () => request<{ tokens: TenantApiToken[] }>("GET", "/api/v1/team/tokens"),
+  revokeTeamToken: (id: string) => request<void>("DELETE", `/api/v1/team/tokens/${id}`),
+
   // Documents
   documentUrl: (kind: "offer" | "igtr", invoiceId: string, format: "pdf" | "docx", templateId?: string) =>
     `${BASE}/api/v1/documents/${kind}/${invoiceId}?format=${format}` +
@@ -129,6 +138,7 @@ export const api = {
   // Uploadable Offer/IGTR templates
   templates: (kind?: "offer" | "igtr") =>
     request<{ data: TemplateMeta[] }>("GET", `/api/v1/templates${kind ? "?kind=" + kind : ""}`),
+  templateFields: () => request<TemplateFieldCatalog>("GET", "/api/v1/templates/fields"),
   deleteTemplate: (id: string) => request<void>("DELETE", `/api/v1/templates/${id}`),
   uploadTemplate: async (kind: "offer" | "igtr", name: string, file: File): Promise<TemplateMeta> => {
     const fd = new FormData();
@@ -158,12 +168,44 @@ export interface TemplateMeta {
   created_at: string;
 }
 
+export interface TemplateField {
+  placeholder: string;
+  name: string;
+  description: string;
+}
+
+export interface TemplateFieldCatalog {
+  header: TemplateField[];
+  line: TemplateField[];
+}
+
 export interface MemberPerm {
   user_id: string;
   email: string;
   full_name: string;
   role: string;
   allowed_groups: string[] | null; // null => all sections
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  read_only: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+}
+
+// ApiTokenCreated additionally carries the plaintext token, shown exactly once.
+export interface ApiTokenCreated extends ApiToken {
+  token: string;
+}
+
+// TenantApiToken is the admin view: a token plus its owner.
+export interface TenantApiToken extends ApiToken {
+  user_id: string;
+  user_email: string;
+  user_name: string;
 }
 
 export { BASE };

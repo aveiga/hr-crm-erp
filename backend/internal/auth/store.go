@@ -5,6 +5,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -134,6 +135,139 @@ func (s *Store) MembershipFor(ctx context.Context, userID, tenantID uuid.UUID) (
 	return role, allowedGroups, true, nil
 }
 
+// --- API tokens ------------------------------------------------------------
+
+// ErrTokenNotFound is returned when revoking a token that doesn't exist or
+// isn't owned by the caller.
+var ErrTokenNotFound = errors.New("token not found")
+
+// APIToken is the safe (secret-free) view of a per-agent token.
+type APIToken struct {
+	ID         uuid.UUID  `json:"id"`
+	Name       string     `json:"name"`
+	ReadOnly   bool       `json:"read_only"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at"`
+	ExpiresAt  *time.Time `json:"expires_at"`
+}
+
+// CreateAPIToken persists a token hash for a member and returns its metadata.
+func (s *Store) CreateAPIToken(ctx context.Context, tenantID, userID uuid.UUID, name string, readOnly bool, expiresAt *time.Time, tokenHash string) (APIToken, error) {
+	t := APIToken{Name: name, ReadOnly: readOnly, ExpiresAt: expiresAt}
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO api_tokens(tenant_id, user_id, name, token_hash, read_only, expires_at)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING id, created_at`,
+		tenantID, userID, name, tokenHash, readOnly, expiresAt).Scan(&t.ID, &t.CreatedAt)
+	return t, err
+}
+
+// ListAPITokens returns a member's active (non-revoked) tokens, without secrets.
+func (s *Store) ListAPITokens(ctx context.Context, tenantID, userID uuid.UUID) ([]APIToken, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, read_only, created_at, last_used_at, expires_at
+		 FROM api_tokens
+		 WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL
+		 ORDER BY created_at DESC`, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIToken{}
+	for rows.Next() {
+		var t APIToken
+		if err := rows.Scan(&t.ID, &t.Name, &t.ReadOnly, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RevokeAPIToken soft-deletes a token, scoped to its owner so a member can only
+// revoke their own tokens.
+func (s *Store) RevokeAPIToken(ctx context.Context, tenantID, userID, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = now()
+		 WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND revoked_at IS NULL`,
+		id, tenantID, userID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTokenNotFound
+	}
+	return nil
+}
+
+// TenantAPIToken is an APIToken enriched with its owner, for the admin view.
+type TenantAPIToken struct {
+	APIToken
+	UserID    uuid.UUID `json:"user_id"`
+	UserEmail string    `json:"user_email"`
+	UserName  string    `json:"user_name"`
+}
+
+// ListTenantTokens returns every active (non-revoked, non-expired) token in a
+// tenant with its owner, for admins.
+func (s *Store) ListTenantTokens(ctx context.Context, tenantID uuid.UUID) ([]TenantAPIToken, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT t.id, t.name, t.read_only, t.created_at, t.last_used_at, t.expires_at,
+		        t.user_id, u.email, u.full_name
+		 FROM api_tokens t JOIN users u ON u.id = t.user_id
+		 WHERE t.tenant_id=$1 AND t.revoked_at IS NULL
+		   AND (t.expires_at IS NULL OR t.expires_at > now())
+		 ORDER BY t.created_at DESC`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TenantAPIToken{}
+	for rows.Next() {
+		var t TenantAPIToken
+		if err := rows.Scan(&t.ID, &t.Name, &t.ReadOnly, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt,
+			&t.UserID, &t.UserEmail, &t.UserName); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RevokeTenantToken revokes any token in a tenant, regardless of owner (admin).
+func (s *Store) RevokeTenantToken(ctx context.Context, tenantID, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE api_tokens SET revoked_at = now()
+		 WHERE id=$1 AND tenant_id=$2 AND revoked_at IS NULL`, id, tenantID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTokenNotFound
+	}
+	return nil
+}
+
+// ResolveAPIToken validates a token hash (not revoked, not expired), stamps
+// last_used_at, and returns the owning membership plus the token's read-only
+// flag and the user's email. ok is false for an unknown/revoked/expired token.
+func (s *Store) ResolveAPIToken(ctx context.Context, tokenHash string) (userID, tenantID uuid.UUID, email string, readOnly, ok bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`UPDATE api_tokens t SET last_used_at = now()
+		 FROM users u
+		 WHERE t.token_hash=$1 AND u.id = t.user_id
+		   AND t.revoked_at IS NULL
+		   AND (t.expires_at IS NULL OR t.expires_at > now())
+		 RETURNING t.user_id, t.tenant_id, u.email, t.read_only`,
+		tokenHash).Scan(&userID, &tenantID, &email, &readOnly)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, uuid.Nil, "", false, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", false, false, err
+	}
+	return userID, tenantID, email, readOnly, true, nil
+}
+
 // MemberPerm describes a member's role and section access for the matrix.
 type MemberPerm struct {
 	UserID        uuid.UUID `json:"user_id"`
@@ -183,12 +317,12 @@ func (s *Store) SetMemberGroups(ctx context.Context, tenantID, userID uuid.UUID,
 }
 
 type Invite struct {
-	ID        uuid.UUID `json:"id"`
-	TenantID  uuid.UUID `json:"tenant_id"`
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	Token     string    `json:"token"`
-	Accepted  bool      `json:"accepted"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Email    string    `json:"email"`
+	Role     string    `json:"role"`
+	Token    string    `json:"token"`
+	Accepted bool      `json:"accepted"`
 }
 
 func (s *Store) CreateInvite(ctx context.Context, tenantID, invitedBy uuid.UUID, email, role string) (Invite, error) {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -10,6 +11,27 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// APITokenPrefix marks a bearer token as a long-lived per-agent API token
+// (rather than a login JWT), so the middleware can route it to the right
+// verifier just by looking at the prefix.
+const APITokenPrefix = "hrcrm_pat_"
+
+// NewAPIToken mints a random API token. It returns the plaintext (shown to the
+// user exactly once) and the SHA-256 hash to persist; the plaintext is never
+// stored.
+func NewAPIToken() (plaintext, hash string) {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	plaintext = APITokenPrefix + hex.EncodeToString(b)
+	return plaintext, HashAPIToken(plaintext)
+}
+
+// HashAPIToken returns the hex SHA-256 of a token, used for storage and lookup.
+func HashAPIToken(plaintext string) string {
+	sum := sha256.Sum256([]byte(plaintext))
+	return hex.EncodeToString(sum[:])
+}
 
 // Claims is the JWT payload. It binds a user to one active tenant + role so the
 // API stays stateless; switching tenants means minting a new token.

@@ -122,6 +122,9 @@ All under `/api/v1`. Auth via `Authorization: Bearer <token>`.
 | POST                  | `/auth/switch-tenant`                 | Re-issue token for another org  |
 | POST                  | `/auth/accept-invite`                 | Join an org via invite token    |
 | GET/POST              | `/team/members`, `/team/invites`      | Team admin (admin only)         |
+| GET/POST/DELETE       | `/tokens`, `/tokens/{id}`             | Manage your own API tokens      |
+| GET/DELETE            | `/team/tokens`, `/team/tokens/{id}`   | All org API tokens (admin only) |
+| POST                  | `/mcp`                                | MCP endpoint for AI agents      |
 | GET                   | `/meta`                               | Entity catalog (drives the UI)  |
 | GET                   | `/dashboard`                          | KPIs + record counts            |
 | GET/POST              | `/entities/{entity}`                  | List / create                   |
@@ -130,6 +133,71 @@ All under `/api/v1`. Auth via `Authorization: Bearer <token>`.
 
 List query params: `page`, `page_size`, `q` (search), `sort`, `dir=desc`,
 `f_<field>=value` (equality filter).
+
+## MCP server (AI agents)
+
+The app exposes a **Model Context Protocol** endpoint so agents (Claude Code,
+GitHub Copilot CLI, etc.) can drive it directly. Like the REST API and UI, the
+tool set is **generated from the module catalog** — every module gets
+`list_/get_/create_/update_/delete_<module>` tools, documents (quotes, invoices,
+…) get `get_doc_/save_doc_/convert_<module>`, plus `describe_schema` and
+`dashboard`. Calls run through the same engine, so **tenancy and section
+permissions are enforced** exactly as elsewhere, and a read-only token can read
+but not write.
+
+- **Endpoint:** `POST /api/v1/mcp` (Streamable HTTP transport).
+- **Auth:** an API token, sent as `Authorization: Bearer <token>`.
+
+### 1. Create an API token
+
+In the UI: **Team → API tokens → Create token** (name it, optionally tick
+**Read-only** / set an expiry). The token is shown **once** — copy it. It starts
+with `hrcrm_pat_`. Or via the API:
+
+```bash
+curl -sX POST http://localhost:8080/api/v1/tokens \
+  -H "Authorization: Bearer <your-login-jwt>" -H 'Content-Type: application/json' \
+  -d '{"name":"claude-code","read_only":true}' | jq -r .token
+```
+
+A token inherits your role and section access, works until revoked (Team → API
+tokens, admins see the whole org), and — unlike a login JWT — doesn't expire on
+the short login cadence. Tip: for an agent, create a dedicated member (e.g. a
+`viewer`, or a `member` restricted to some sections) and mint the token from it.
+
+### 2a. Claude Code
+
+```bash
+claude mcp add --transport http hr-crm-erp http://localhost:8080/api/v1/mcp \
+  --header "Authorization: Bearer hrcrm_pat_..."
+```
+
+Or commit a project-scoped `.mcp.json` (keep the secret in an env var):
+
+```json
+{
+  "mcpServers": {
+    "hr-crm-erp": {
+      "type": "http",
+      "url": "http://localhost:8080/api/v1/mcp",
+      "headers": { "Authorization": "Bearer ${HRCRM_TOKEN}" }
+    }
+  }
+}
+```
+
+### 2b. GitHub Copilot CLI
+
+Run `/mcp add`, choose the **remote / HTTP** server type, enter the URL
+`http://localhost:8080/api/v1/mcp`, and set the header
+`{"Authorization": "Bearer hrcrm_pat_..."}` (stored in `~/.copilot/mcp-config.json`).
+
+> If Copilot tries OAuth discovery and fails with `MCPOAuthError`, run
+> `/mcp enable` for the server — this server authenticates by header, not OAuth.
+
+Then ask the agent to `describe_schema` first, and it can list/search/create
+across your data. Use `https://` in production (bearer tokens are plaintext over
+HTTP).
 
 ## Documents
 
@@ -189,7 +257,7 @@ This repo ships Claude Code skills in `.claude/skills/` to speed up future work:
 ## Repository layout
 
 ```
-backend/         Go API (cmd/server, internal/{config,db,httpx,cache,auth,resource,documents,server})
+backend/         Go API (cmd/server, internal/{config,db,httpx,cache,auth,resource,documents,mcpsrv,server})
 frontend/        Next.js + Tailwind app (app/, components/, lib/)
 templates/       Offer & IGTR document templates (editable XML bodies)
 .devcontainer/   Dev environment (app + Postgres + Redis + LibreOffice)

@@ -16,6 +16,10 @@ type Principal struct {
 	// AllowedGroups restricts which sections the member may access. nil means
 	// full access (no restriction). Ignored for owners/admins.
 	AllowedGroups []string
+	// IsAPIToken reports that the request was authenticated with a per-agent API
+	// token rather than an interactive login. Used to block token management
+	// (minting/revoking) so a token can't be used to escalate its own privileges.
+	IsAPIToken bool
 }
 
 func (p Principal) IsAdmin() bool { return p.Role == "owner" || p.Role == "admin" }
