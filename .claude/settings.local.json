@@ -14,7 +14,9 @@
       "Bash(libreoffice --version)",
       "Bash(go mod *)",
       "Bash(go build *)",
-      "Bash(echo \"BUILD_EXIT=$?\")"
+      "Bash(echo \"BUILD_EXIT=$?\")",
+      "mcp__hr-crm-erp__dashboard",
+      "mcp__hr-crm-erp__list_opportunities"
     ]
   }
 }

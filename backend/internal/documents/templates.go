@@ -89,6 +89,12 @@ func NewTemplateHandlers(store *TemplateStore) *TemplateHandlers {
 	return &TemplateHandlers{store: store}
 }
 
+// GET /api/v1/templates/fields -> the placeholders available to templates and
+// their descriptions. Static (no tenant data), so any authenticated user can read it.
+func (h *TemplateHandlers) Fields(w http.ResponseWriter, r *http.Request) {
+	httpx.JSON(w, http.StatusOK, FieldCatalog())
+}
+
 // GET /api/v1/templates?kind=offer|igtr
 func (h *TemplateHandlers) List(w http.ResponseWriter, r *http.Request) {
 	p, _ := httpx.MustPrincipal(r)
@@ -159,4 +165,3 @@ func (h *TemplateHandlers) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
-

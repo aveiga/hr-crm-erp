@@ -11,6 +11,7 @@ import (
 	"hrcrm/internal/config"
 	"hrcrm/internal/documents"
 	"hrcrm/internal/httpx"
+	"hrcrm/internal/mcpsrv"
 	"hrcrm/internal/resource"
 )
 
@@ -49,6 +50,8 @@ func (s *Server) Handler() http.Handler {
 	docH := documents.NewHandlers(pdfSvc, s.pool, s.cfg.SofficeBin)
 	tmplH := documents.NewTemplateHandlers(tmplStore)
 
+	mcpH := mcpsrv.New(s.reg, repo, docSvc)
+
 	mux := http.NewServeMux()
 
 	// Health.
@@ -68,12 +71,21 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/auth/me", protected(authH.Me))
 	mux.Handle("POST /api/v1/auth/switch-tenant", protected(authH.SwitchTenant))
 
+	// Per-agent API tokens: any authenticated member manages their own; the
+	// handlers block management when the caller is itself an API token.
+	mux.Handle("GET /api/v1/tokens", protected(authH.ListTokens))
+	mux.Handle("POST /api/v1/tokens", protected(authH.CreateToken))
+	mux.Handle("DELETE /api/v1/tokens/{id}", protected(authH.RevokeToken))
+
 	// Team administration.
 	mux.Handle("GET /api/v1/team/members", admin(authH.ListMembers))
 	mux.Handle("GET /api/v1/team/invites", admin(authH.ListInvites))
 	mux.Handle("POST /api/v1/team/invites", admin(authH.CreateInvite))
 	mux.Handle("GET /api/v1/team/permissions", admin(authH.GetPermissions))
 	mux.Handle("PUT /api/v1/team/permissions", admin(authH.SetPermissions))
+	// Tenant-wide API token administration.
+	mux.Handle("GET /api/v1/team/tokens", admin(authH.ListAllTokens))
+	mux.Handle("DELETE /api/v1/team/tokens/{id}", admin(authH.RevokeAnyToken))
 
 	// Metadata + dashboard.
 	mux.Handle("GET /api/v1/meta", protected(resH.Meta))
@@ -96,7 +108,14 @@ func (s *Server) Handler() http.Handler {
 	// Documents.
 	mux.Handle("GET /api/v1/documents/{kind}/{invoice_id}", protected(docH.Generate))
 
+	// MCP endpoint for agents. Authenticated like every other route so each
+	// request carries a Principal; the generated tool set is scoped to the
+	// caller's tenant and section permissions, and write tools re-check CanWrite.
+	// The streamable-HTTP transport serves GET/POST/DELETE on this one path.
+	mux.Handle("/api/v1/mcp", authMW.Require(mcpH.Handler()))
+
 	// Uploadable Offer/IGTR templates (list for all; upload/delete admin-only).
+	mux.Handle("GET /api/v1/templates/fields", protected(tmplH.Fields))
 	mux.Handle("GET /api/v1/templates", protected(tmplH.List))
 	mux.Handle("POST /api/v1/templates", admin(tmplH.Upload))
 	mux.Handle("DELETE /api/v1/templates/{id}", admin(tmplH.Delete))
