@@ -7,8 +7,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"hrcrm/internal/auth"
+	"hrcrm/internal/azure"
 	"hrcrm/internal/cache"
 	"hrcrm/internal/config"
+	"hrcrm/internal/db"
 	"hrcrm/internal/documents"
 	"hrcrm/internal/httpx"
 	"hrcrm/internal/mcpsrv"
@@ -20,6 +22,7 @@ type Server struct {
 	pool  *pgxpool.Pool
 	cache *cache.Cache
 	reg   *resource.Registry
+	azure *azure.Service // set by Handler; runs the scheduled Azure sync
 }
 
 // New builds the registry, ensures the schema, and returns a Server.
@@ -30,6 +33,12 @@ func New(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, c *cache.Ca
 	}
 	if err := resource.EnsureSchema(ctx, pool, reg); err != nil {
 		return nil, err
+	}
+	// Data backfills that depend on catalog columns run after the schema step.
+	if cfg.MigrateOnBoot {
+		if err := db.MigrateData(ctx, pool); err != nil {
+			return nil, err
+		}
 	}
 	return &Server{cfg: cfg, pool: pool, cache: c, reg: reg}, nil
 }
@@ -47,10 +56,15 @@ func (s *Server) Handler() http.Handler {
 
 	tmplStore := documents.NewTemplateStore(s.pool)
 	pdfSvc := documents.NewService(s.reg, repo, s.cfg.TemplatesDir, tmplStore)
-	docH := documents.NewHandlers(pdfSvc, s.pool, s.cfg.SofficeBin)
-	tmplH := documents.NewTemplateHandlers(tmplStore)
+	docH := documents.NewHandlers(pdfSvc, s.reg, s.pool, s.cfg.SofficeBin)
+	tmplH := documents.NewTemplateHandlers(tmplStore, s.reg)
 
 	mcpH := mcpsrv.New(s.reg, repo, docSvc)
+
+	s.azure = azure.NewService(s.pool, docSvc, &azure.Client{
+		LoginURL: s.cfg.AzureLoginURL, ManagementURL: s.cfg.AzureManagementURL,
+	}, s.cfg.SecretsKey)
+	azH := azure.NewHandlers(s.azure)
 
 	mux := http.NewServeMux()
 
@@ -62,6 +76,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/signup", authH.Signup)
 	mux.HandleFunc("POST /api/v1/auth/login", authH.Login)
 	mux.HandleFunc("POST /api/v1/auth/accept-invite", authH.AcceptInvite)
+	mux.HandleFunc("POST /api/v1/auth/reset-password", authH.ResetPassword)
 
 	// Authenticated helpers.
 	protected := func(h http.HandlerFunc) http.Handler { return authMW.Require(h) }
@@ -83,6 +98,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/team/invites", admin(authH.CreateInvite))
 	mux.Handle("GET /api/v1/team/permissions", admin(authH.GetPermissions))
 	mux.Handle("PUT /api/v1/team/permissions", admin(authH.SetPermissions))
+	// User manager: member edit/removal, invite lifecycle, reset links.
+	mux.Handle("GET /api/v1/team/users", admin(authH.ListUsers))
+	mux.Handle("PUT /api/v1/team/users/{id}", admin(authH.UpdateUser))
+	mux.Handle("DELETE /api/v1/team/users/{id}", admin(authH.RemoveUser))
+	mux.Handle("POST /api/v1/team/users/{id}/password-reset", admin(authH.CreatePasswordReset))
+	mux.Handle("PUT /api/v1/team/invites/{id}", admin(authH.UpdateInvite))
+	mux.Handle("POST /api/v1/team/invites/{id}/revoke", admin(authH.RevokeInvite))
+	mux.Handle("POST /api/v1/team/invites/{id}/resend", admin(authH.ResendInvite))
 	// Tenant-wide API token administration.
 	mux.Handle("GET /api/v1/team/tokens", admin(authH.ListAllTokens))
 	mux.Handle("DELETE /api/v1/team/tokens/{id}", admin(authH.RevokeAnyToken))
@@ -90,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	// Metadata + dashboard.
 	mux.Handle("GET /api/v1/meta", protected(resH.Meta))
 	mux.Handle("GET /api/v1/dashboard", protected(resH.Dashboard))
+	mux.Handle("GET /api/v1/reports/sales", protected(resH.SalesReport))
 
 	// Document entities (header + line items): quotes, sales orders, invoices,
 	// purchase orders, vendor bills.
@@ -97,16 +121,37 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/docs/{entity}", write(resH.DocCreate))
 	mux.Handle("PUT /api/v1/docs/{entity}/{id}", write(resH.DocUpdate))
 	mux.Handle("POST /api/v1/docs/{entity}/{id}/convert", write(resH.DocConvert))
+	mux.Handle("POST /api/v1/docs/{entity}/{id}/duplicate", write(resH.DocDuplicate))
 
 	// Generic entity CRUD.
 	mux.Handle("GET /api/v1/entities/{entity}", protected(resH.List))
 	mux.Handle("POST /api/v1/entities/{entity}", write(resH.Create))
 	mux.Handle("GET /api/v1/entities/{entity}/{id}", protected(resH.Get))
+	// Upstream links + downstream records (with statuses) of any record.
+	mux.Handle("GET /api/v1/entities/{entity}/{id}/related", protected(resH.Related))
 	mux.Handle("PUT /api/v1/entities/{entity}/{id}", write(resH.Update))
 	mux.Handle("DELETE /api/v1/entities/{entity}/{id}", write(resH.Delete))
 
+	// Azure: usage sync from Cost Management, fee billing, dashboard.
+	mux.Handle("GET /api/v1/azure/dashboard", protected(azH.Dashboard))
+	// CSV fallback for usage (preview is read-only; apply re-checks CanWrite).
+	mux.Handle("POST /api/v1/azure/import", protected(azH.Import))
+	mux.Handle("GET /api/v1/azure/tenants/{id}/credential", protected(azH.Credential))
+	mux.Handle("PUT /api/v1/azure/tenants/{id}/credential", admin(azH.SetCredential))
+	mux.Handle("POST /api/v1/azure/tenants/{id}/test", write(azH.Test))
+	mux.Handle("POST /api/v1/azure/tenants/{id}/sync", write(azH.Sync))
+	mux.Handle("POST /api/v1/azure/agreements", write(azH.CreateAgreement))
+	mux.Handle("GET /api/v1/azure/agreements/{id}/quarters", protected(azH.Quarters))
+	mux.Handle("POST /api/v1/azure/agreements/{id}/refresh", write(azH.Refresh))
+	mux.Handle("POST /api/v1/azure/agreements/{id}/invoices", write(azH.CreateInvoice))
+
 	// Documents.
+	// Deprecated: the original invoice-only route, kept for existing clients.
+	// The UI uses /documents/{kind}/{entity}/{id}.
 	mux.Handle("GET /api/v1/documents/{kind}/{invoice_id}", protected(docH.Generate))
+	// Generate from any source document: quotes (Offers), sales orders, and
+	// service agreements.
+	mux.Handle("GET /api/v1/documents/{kind}/{entity}/{id}", protected(docH.GenerateFrom))
 
 	// MCP endpoint for agents. Authenticated like every other route so each
 	// request carries a Principal; the generated tool set is scoped to the
@@ -125,6 +170,14 @@ func (s *Server) Handler() http.Handler {
 		httpx.Logger,
 		httpx.CORS(s.cfg.CORSOrigin),
 	)
+}
+
+// RunBackground runs scheduled jobs (the daily Azure usage sync) until ctx
+// ends. Call after Handler.
+func (s *Server) RunBackground(ctx context.Context) {
+	if s.azure != nil {
+		go s.azure.RunScheduler(ctx, s.cfg.AzureSyncEvery)
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

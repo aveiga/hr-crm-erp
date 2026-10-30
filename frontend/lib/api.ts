@@ -100,20 +100,26 @@ export const api = {
     request<void>("DELETE", `/api/v1/entities/${entity}/${id}`),
 
   // Documents (header + line items): quotes, sales_orders, invoices, etc.
+  // `children` holds secondary child collections keyed by child entity (e.g. a
+  // service agreement's invoice_schedule); send them back under the same key.
   docGet: (entity: string, id: string) =>
-    request<{ data: Row; lines: Row[] }>("GET", `/api/v1/docs/${entity}/${id}`),
+    request<{ data: Row; lines: Row[]; children?: { [entity: string]: Row[] } }>(
+      "GET",
+      `/api/v1/docs/${entity}/${id}`
+    ),
   docCreate: (entity: string, body: object) =>
     request<{ data: Row }>("POST", `/api/v1/docs/${entity}`, body),
   docUpdate: (entity: string, id: string, body: object) =>
     request<{ data: Row }>("PUT", `/api/v1/docs/${entity}/${id}`, body),
   docConvert: (entity: string, id: string) =>
     request<{ entity: string; data: Row }>("POST", `/api/v1/docs/${entity}/${id}/convert`),
+  docDuplicate: (entity: string, id: string) =>
+    request<{ entity: string; data: Row }>("POST", `/api/v1/docs/${entity}/${id}/duplicate`),
+  related: (entity: string, id: string) =>
+    request<RelatedResult>("GET", `/api/v1/entities/${entity}/${id}/related`),
+  salesReport: () => request<SalesReport>("GET", "/api/v1/reports/sales"),
 
-  // Team
-  members: () => request<{ data: any[] }>("GET", "/api/v1/team/members"),
-  invites: () => request<{ data: any[] }>("GET", "/api/v1/team/invites"),
-  invite: (b: { email: string; role: string }) =>
-    request<any>("POST", "/api/v1/team/invites", b),
+  // Team members and invites are managed through `userAdmin` (User Manager).
 
   // Permissions matrix
   permissions: () =>
@@ -131,11 +137,18 @@ export const api = {
   revokeTeamToken: (id: string) => request<void>("DELETE", `/api/v1/team/tokens/${id}`),
 
   // Documents
-  documentUrl: (kind: "offer" | "igtr", invoiceId: string, format: "pdf" | "docx", templateId?: string) =>
-    `${BASE}/api/v1/documents/${kind}/${invoiceId}?format=${format}` +
+  // Generate from a source document (quotes → Offer, invoices → Service Agreement).
+  documentUrlFor: (
+    kind: "offer" | "igtr",
+    entity: string,
+    id: string,
+    format: "pdf" | "docx",
+    templateId?: string
+  ) =>
+    `${BASE}/api/v1/documents/${kind}/${entity}/${id}?format=${format}` +
     (templateId ? `&template_id=${templateId}` : ""),
 
-  // Uploadable Offer/IGTR templates
+  // Uploadable Offer / Service Agreement (kind "igtr") templates
   templates: (kind?: "offer" | "igtr") =>
     request<{ data: TemplateMeta[] }>("GET", `/api/v1/templates${kind ? "?kind=" + kind : ""}`),
   templateFields: () => request<TemplateFieldCatalog>("GET", "/api/v1/templates/fields"),
@@ -172,11 +185,59 @@ export interface TemplateField {
   placeholder: string;
   name: string;
   description: string;
+  group?: string; // record a namespaced field reads from, e.g. "Account"
 }
 
 export interface TemplateFieldCatalog {
   header: TemplateField[];
   line: TemplateField[];
+  schedule?: TemplateField[];
+}
+
+type Num = number;
+export interface InstallmentRow {
+  id: string;
+  agreement_id: string;
+  agreement: string;
+  account: string | null;
+  currency: string;
+  due_date: string;
+  description: string | null;
+  amount: Num;
+  paid: Num;
+  outstanding: Num;
+}
+// Each section is present only when the caller can access its module.
+export interface SalesReport {
+  agreements?: {
+    by_currency: { currency: string; count: Num; contracted: Num; paid: Num; outstanding: Num }[];
+    by_payment_status: { status: string; count: Num; outstanding: Num; overdue: Num }[];
+    by_status: { status: string; count: Num; contracted: Num }[];
+  };
+  overdue_installments?: InstallmentRow[];
+  upcoming_installments?: InstallmentRow[];
+  quotes?: {
+    by_status: { status: string; count: Num; net: Num; grand: Num }[];
+    conversion: { quotes: Num; accepted: Num; contracted: Num; accepted_not_contracted: Num; open_expired: Num };
+    by_month: { month: string; count: Num; net: Num }[];
+  };
+  payments?: {
+    by_month: { month: string; count: Num; amount: Num }[];
+    by_method: { method: string; count: Num; amount: Num }[];
+    unallocated: { count: Num; amount: Num };
+  };
+}
+
+export interface RelatedRecord {
+  entity: string;
+  id: string;
+  title: string;
+  status?: string;
+}
+
+export interface RelatedResult {
+  upstream: { field: string; label: string; record: RelatedRecord }[];
+  downstream: { entity: string; field: string; label: string; total: number; rows: RelatedRecord[] }[];
 }
 
 export interface MemberPerm {
@@ -209,3 +270,166 @@ export interface TenantApiToken extends ApiToken {
 }
 
 export { BASE };
+
+// --- Azure (usage sync, fee billing, dashboard) ------------------------------
+export const azure = {
+  dashboard: (qs: string) => request<AzureDashboard>("GET", `/api/v1/azure/dashboard?${qs}`),
+  credential: (id: string) => request<AzureCredential>("GET", `/api/v1/azure/tenants/${id}/credential`),
+  setCredential: (id: string, b: { client_secret: string; expires_on?: string }) =>
+    request<AzureCredential>("PUT", `/api/v1/azure/tenants/${id}/credential`, b),
+  test: (id: string) =>
+    request<{ subscriptions: { subscriptionId: string; displayName: string; state: string }[] }>(
+      "POST",
+      `/api/v1/azure/tenants/${id}/test`
+    ),
+  sync: (id: string, b: { from?: string; to?: string }) =>
+    request<{ status: string; from: string; to: string }>("POST", `/api/v1/azure/tenants/${id}/sync`, b),
+  createAgreement: (b: {
+    account_id: string;
+    period_start: string;
+    period_end: string;
+    description?: string;
+    markup_pct?: number;
+    vat_pct?: number;
+  }) => request<{ entity: string; data: Row }>("POST", "/api/v1/azure/agreements", b),
+  quarters: (id: string) =>
+    request<{ quarters: AzureQuarter[]; synced_through: string }>("GET", `/api/v1/azure/agreements/${id}/quarters`),
+  refresh: (id: string) => request<{ entity: string; data: Row }>("POST", `/api/v1/azure/agreements/${id}/refresh`),
+  invoice: (id: string, period_start: string, force = false) =>
+    request<{ entity: string; data: Row; warnings: string[] | null }>(
+      "POST",
+      `/api/v1/azure/agreements/${id}/invoices`,
+      { period_start, force }
+    ),
+};
+
+// importCsv uploads a Cost Management CSV: mode "preview" compares it with the
+// stored usage; "apply" writes it (overwrite = change keys to replace).
+export async function azureImportCsv(
+  file: File,
+  fields: { mode: "preview" | "apply"; azure_tenant_id?: string; overwrite?: string[]; overwrite_all?: boolean }
+): Promise<AzureImportResult> {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("mode", fields.mode);
+  if (fields.azure_tenant_id) fd.append("azure_tenant_id", fields.azure_tenant_id);
+  if (fields.overwrite) fd.append("overwrite", JSON.stringify(fields.overwrite));
+  if (fields.overwrite_all) fd.append("overwrite_all", "true");
+  const res = await fetch(`${BASE}/api/v1/azure/import`, {
+    method: "POST",
+    headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+    body: fd,
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) {
+    const err = data?.error || {};
+    throw new ApiError(res.status, err.code || "error", err.message || res.statusText);
+  }
+  return data as AzureImportResult;
+}
+
+export interface AzureImportChange {
+  key: string;
+  subscription: string;
+  date: string;
+  existing: number;
+  existing_currency: string;
+  incoming: number;
+  currency: string;
+}
+
+export interface AzureImportResult {
+  rows: number;
+  from: string;
+  to: string;
+  subscriptions: { key: string; name: string; subscription_id: string; row_id?: string; days: number; total: number; currency: string }[];
+  new_days: number;
+  unchanged_days: number;
+  changes: AzureImportChange[];
+  warnings?: string[];
+  // apply only
+  added_days?: number;
+  overwritten_days?: number;
+  kept_days?: number;
+  new_subscriptions?: number;
+  synced_through?: string;
+}
+
+export interface AzureCredential {
+  has_secret: boolean;
+  expires_on?: string;
+  updated_at?: string;
+}
+
+export interface AzureQuarter {
+  label: string;
+  period_start: string;
+  period_end: string;
+  amount: number;
+  basis: string;
+  usage_complete: boolean;
+  ended: boolean;
+  installment?: { id: string; due_date: string; amount: number; paid_amount: number; status: string };
+  invoice?: { ID: string; Status: string; Net: number; Grand: number; InvoiceNumber: string };
+}
+
+export interface AzureAmounts {
+  usage: number;
+  fee: number;
+  forecast_usage: number;
+  forecast_fee: number;
+  fee_with_markup: number;
+}
+
+export interface AzureDashboard {
+  from: string;
+  to: string;
+  synced_through: string;
+  markup_pct: number;
+  totals: ({ currency: string } & AzureAmounts)[];
+  by_month: ({ month: string; currency: string } & AzureAmounts)[];
+  by_subscription: ({
+    id: string;
+    subscription_id: string;
+    name: string;
+    account_id: string;
+    account: string;
+    type: string;
+    fee_pct: number | null;
+    currency: string;
+    daily_run_rate: number;
+  } & AzureAmounts)[];
+  by_account: ({ account_id: string; account: string; currency: string; subscriptions: number } & AzureAmounts)[];
+  invoiced: { currency: string; count: number; net: number; invoiced: number; paid: number; due: number; overdue: number; drafts: number }[] | null;
+  agreement_forecast: { currency: string; basis: string; quarters: number; net: number; with_markup: number }[] | null;
+  warnings?: string[];
+}
+
+// --- User manager (admin) ---------------------------------------------------
+// Kept separate from `api` so the original team calls keep their shapes.
+import type { TeamUser, TeamInvite, PasswordResetLink } from "./types";
+
+export const userAdmin = {
+  users: () => request<{ groups: string[]; data: TeamUser[] }>("GET", "/api/v1/team/users"),
+  // Partial update; omit allowed_groups to leave access unchanged, null => full.
+  updateUser: (
+    id: string,
+    b: { full_name?: string; email?: string; role?: string; allowed_groups?: string[] | null }
+  ) => request<{ data: TeamUser }>("PUT", `/api/v1/team/users/${id}`, b),
+  removeUser: (id: string) => request<void>("DELETE", `/api/v1/team/users/${id}`),
+  passwordReset: (id: string) =>
+    request<PasswordResetLink>("POST", `/api/v1/team/users/${id}/password-reset`),
+
+  invites: () => request<{ data: TeamInvite[] | null }>("GET", "/api/v1/team/invites"),
+  invite: (b: { email: string; role: string; allowed_groups: string[] | null }) =>
+    request<TeamInvite>("POST", "/api/v1/team/invites", b),
+  updateInvite: (id: string, b: { role: string; allowed_groups: string[] | null }) =>
+    request<TeamInvite>("PUT", `/api/v1/team/invites/${id}`, b),
+  revokeInvite: (id: string) => request<TeamInvite>("POST", `/api/v1/team/invites/${id}/revoke`),
+  resendInvite: (id: string) => request<TeamInvite>("POST", `/api/v1/team/invites/${id}/resend`),
+
+  // Public: redeem a reset link.
+  resetPassword: (b: { token: string; password: string }) =>
+    request<{ ok: boolean }>("POST", "/api/v1/auth/reset-password", b),
+};

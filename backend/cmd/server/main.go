@@ -61,6 +61,7 @@ func main() {
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	srv.RunBackground(ctx)
 
 	go func() {
 		slog.Info("server listening", "addr", cfg.HTTPAddr, "env", cfg.Env)

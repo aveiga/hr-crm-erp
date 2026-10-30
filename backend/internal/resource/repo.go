@@ -15,7 +15,9 @@ import (
 )
 
 type Repo struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	reg   *Registry             // enables field rules; see rules.go
+	hooks map[string]WriteHooks // per-entity write hooks
 }
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
@@ -27,7 +29,12 @@ type ListOptions struct {
 	Search   string
 	Sort     string            // field key
 	Desc     bool
-	Filters  map[string]string // field key -> value
+	Filters  map[string]string // field key -> value (equality; "@empty" = blank)
+	// In matches any of several values; Min/Max are inclusive bounds for
+	// dates and numbers. Values may use date tokens (see resolveToken).
+	In  map[string][]string
+	Min map[string]string
+	Max map[string]string
 }
 
 type ListResult struct {
@@ -51,12 +58,44 @@ func (r *Repo) List(ctx context.Context, e Entity, tenantID uuid.UUID, opt ListO
 
 	// Equality filters on known fields.
 	for k, v := range opt.Filters {
-		if _, ok := e.field(k); !ok || v == "" {
+		f, ok := e.field(k)
+		if !ok || v == "" {
 			continue
 		}
+		if v == "@empty" {
+			where = append(where, fmt.Sprintf("(%s IS NULL OR %s::text = '')", quoteIdent(k), quoteIdent(k)))
+			continue
+		}
+		arg := filterArg(f, resolveToken(v))
+		if arg == nil {
+			arg = v // as before: let Postgres cast the raw value
+		}
 		where = append(where, fmt.Sprintf("%s = $%d", quoteIdent(k), argN))
-		args = append(args, v)
+		args = append(args, arg)
 		argN++
+	}
+	for k, vals := range opt.In {
+		if _, ok := e.field(k); !ok || len(vals) == 0 {
+			continue
+		}
+		where = append(where, fmt.Sprintf("%s::text = ANY($%d)", quoteIdent(k), argN))
+		args = append(args, vals)
+		argN++
+	}
+	for op, bounds := range map[string]map[string]string{">=": opt.Min, "<=": opt.Max} {
+		for k, v := range bounds {
+			f, ok := e.field(k)
+			if !ok || v == "" || !isRangeable(f.Type) {
+				continue
+			}
+			arg := filterArg(f, resolveToken(v))
+			if arg == nil {
+				continue // unparseable bound: ignore rather than fail the list
+			}
+			where = append(where, fmt.Sprintf("%s %s $%d", quoteIdent(k), op, argN))
+			args = append(args, arg)
+			argN++
+		}
 	}
 
 	// Free-text search across text-like fields.
@@ -127,6 +166,10 @@ func (r *Repo) Get(ctx context.Context, e Entity, tenantID, id uuid.UUID) (map[s
 }
 
 func (r *Repo) Create(ctx context.Context, e Entity, tenantID uuid.UUID, input map[string]any) (map[string]any, error) {
+	input, err := r.prepareWrite(ctx, e, tenantID, nil, input)
+	if err != nil {
+		return nil, err
+	}
 	cols := []string{"tenant_id"}
 	placeholders := []string{"$1"}
 	args := []any{tenantID}
@@ -156,15 +199,26 @@ func (r *Repo) Create(ctx context.Context, e Entity, tenantID uuid.UUID, input m
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	data, err := scanRows(rows)
+	rows.Close()
 	if err != nil {
 		return nil, err
 	}
+	r.afterWrite(ctx, e, tenantID, nil, data[0])
 	return data[0], nil
 }
 
 func (r *Repo) Update(ctx context.Context, e Entity, tenantID, id uuid.UUID, input map[string]any) (map[string]any, error) {
+	var stored map[string]any
+	if r.reg != nil {
+		var err error
+		if stored, err = r.Get(ctx, e, tenantID, id); err != nil {
+			return nil, err
+		}
+		if input, err = r.prepareWrite(ctx, e, tenantID, stored, input); err != nil {
+			return nil, err
+		}
+	}
 	sets := []string{"updated_at = now()"}
 	args := []any{tenantID, id}
 	argN := 3
@@ -192,18 +246,26 @@ func (r *Repo) Update(ctx context.Context, e Entity, tenantID, id uuid.UUID, inp
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	data, err := scanRows(rows)
+	rows.Close()
 	if err != nil {
 		return nil, err
 	}
 	if len(data) == 0 {
 		return nil, httpx.ErrNotFound
 	}
+	r.afterWrite(ctx, e, tenantID, stored, data[0])
 	return data[0], nil
 }
 
 func (r *Repo) Delete(ctx context.Context, e Entity, tenantID, id uuid.UUID) error {
+	var before map[string]any
+	if r.hooked(e) {
+		var err error
+		if before, err = r.Get(ctx, e, tenantID, id); err != nil {
+			return err
+		}
+	}
 	tag, err := r.pool.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE tenant_id=$1 AND id=$2", e.Table()), tenantID, id)
 	if err != nil {
 		return err
@@ -211,6 +273,7 @@ func (r *Repo) Delete(ctx context.Context, e Entity, tenantID, id uuid.UUID) err
 	if tag.RowsAffected() == 0 {
 		return httpx.ErrNotFound
 	}
+	r.afterWrite(ctx, e, tenantID, before, nil)
 	return nil
 }
 
@@ -272,6 +335,46 @@ func scanRows(rows pgx.Rows) ([]map[string]any, error) {
 	return out, rows.Err()
 }
 
+func isRangeable(t FieldType) bool {
+	switch t {
+	case TypeDate, TypeDateTime, TypeInt, TypeNumber, TypeMoney, TypePercent:
+		return true
+	}
+	return false
+}
+
+// filterArg converts a filter value to the column's type; nil when it can't.
+func filterArg(f Field, v string) any {
+	switch f.Type {
+	case TypeDate, TypeDateTime, TypeInt, TypeNumber, TypeMoney, TypePercent, TypeBool:
+		val, err := coerce(f, v)
+		if err != nil {
+			return nil
+		}
+		return val
+	}
+	return v
+}
+
+// resolveToken expands relative date tokens in filter values so saved views
+// stay current: @today, @today+N / @today-N (days), @month (first of month).
+func resolveToken(v string) string {
+	now := time.Now()
+	switch {
+	case v == "@today":
+		return now.Format("2006-01-02")
+	case v == "@month":
+		return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	case strings.HasPrefix(v, "@today+") || strings.HasPrefix(v, "@today-"):
+		n, err := strconv.Atoi(v[len("@today"):])
+		if err != nil {
+			return v
+		}
+		return now.AddDate(0, 0, n).Format("2006-01-02")
+	}
+	return v
+}
+
 func isTextual(t FieldType) bool {
 	switch t {
 	case TypeText, TypeLongText, TypeSelect, TypeRef, TypeEmail:
@@ -302,11 +405,15 @@ func coerce(f Field, raw any) (any, error) {
 	case TypeNumber, TypeMoney, TypePercent:
 		return toFloat(f, raw)
 	case TypeBool:
-		b, ok := raw.(bool)
-		if !ok {
-			return nil, badType(f, "boolean")
+		switch b := raw.(type) {
+		case bool:
+			return b, nil
+		case string: // catalog defaults are strings
+			if v, err := strconv.ParseBool(b); err == nil {
+				return v, nil
+			}
 		}
-		return b, nil
+		return nil, badType(f, "boolean")
 	case TypeDate:
 		return toDate(f, raw)
 	case TypeDateTime:

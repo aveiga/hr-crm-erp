@@ -13,11 +13,26 @@ import (
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
+//go:embed datamigrations/*.sql
+var dataMigrationFS embed.FS
+
 // Migrate applies every embedded migration file exactly once, in filename
 // order, recording applied versions in schema_migrations. It is safe to run on
 // every boot. This is a deliberately tiny runner so we avoid a migration-tool
 // dependency.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return apply(ctx, pool, migrationFS, "migrations", "")
+}
+
+// MigrateData applies data migrations (datamigrations/*.sql) exactly once
+// each. Unlike Migrate it runs AFTER the metadata engine's EnsureSchema, so a
+// data backfill can rely on entity columns that a catalog change just added.
+// Versions are recorded in schema_migrations prefixed with "data/".
+func MigrateData(ctx context.Context, pool *pgxpool.Pool) error {
+	return apply(ctx, pool, dataMigrationFS, "datamigrations", "data/")
+}
+
+func apply(ctx context.Context, pool *pgxpool.Pool, fsys embed.FS, dir, prefix string) error {
 	_, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -26,7 +41,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	entries, err := migrationFS.ReadDir("migrations")
+	entries, err := fsys.ReadDir(dir)
 	if err != nil {
 		return err
 	}
@@ -40,13 +55,14 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, name := range names {
 		var exists bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, name).Scan(&exists); err != nil {
+		version := prefix + name
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&exists); err != nil {
 			return err
 		}
 		if exists {
 			continue
 		}
-		sqlBytes, err := migrationFS.ReadFile("migrations/" + name)
+		sqlBytes, err := fsys.ReadFile(dir + "/" + name)
 		if err != nil {
 			return err
 		}
@@ -58,7 +74,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, name); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, version); err != nil {
 			_ = tx.Rollback(ctx)
 			return err
 		}
@@ -67,11 +83,4 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	return nil
-}
-
-// Exec runs an arbitrary statement (used by the metadata engine to ensure
-// generated entity tables exist).
-func Exec(ctx context.Context, pool *pgxpool.Pool, sql string) error {
-	_, err := pool.Exec(ctx, sql)
-	return err
 }

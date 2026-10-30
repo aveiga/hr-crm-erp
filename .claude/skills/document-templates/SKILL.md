@@ -1,23 +1,35 @@
 ---
 name: document-templates
-description: Edit, add, or debug the Offer and IGTR document templates (Word/PDF generation). Use when the user wants to change how generated Offers or Invoices/IGTRs look, add a new merge field, fix a placeholder that isn't filling, swap in their own finished Word .docx, or add a new document type.
+description: Edit, add, or debug the Offer and Service Agreement (kind "igtr") document templates (Word/PDF generation). Use when the user wants to change how generated Offers or Service Agreements look, add a new merge field, fix a placeholder that isn't filling, swap in their own finished Word .docx, or add a new document type.
 ---
 
-# Document templates (Offer / IGTR)
+# Document templates (Offer / Service Agreement)
 
 Generated documents reproduce the original Excel + Word-VBA flow, but headless
 on Linux via LibreOffice. Code lives in `backend/internal/documents/`.
 
 ## How it works
 
-1. `service.go` loads invoice data (invoice + lines + account + legal entity),
-   builds a `values` map (scalars) and a `lines` slice, all tenant-scoped.
-2. `docx.go` fills a template:
+Offers are generated from **Quotes**, Service Agreements from **Service
+Agreements** (entity key `invoices`). Route:
+`GET /api/v1/documents/{kind}/{entity}/{id}` (the original
+`/documents/{kind}/{invoice_id}` still works and means `invoices`).
+
+1. `service.go` loads the source document, then walks its refs breadth-first
+   (`gather`): quote → opportunity, account, contact, seller
+   legal entity. All tenant-scoped.
+2. It builds the scalar `values`: the original flat fields (`buildValues`), plus
+   **every catalog field** of every gathered record as `{{prefix.field}}`
+   (`scalarPrefix`: `quote`, `service_agreement`, `opportunity`,
+   `account`, `contact`, `legal_entity`) and the source itself as `{{doc.field}}`.
+   Refs render as the target's title, dates `dd-mm-yyyy`, money 2 decimals.
+   New catalog fields become placeholders automatically.
+3. `docx.go` fills the template (`word/document.xml`, headers and footers):
    - **Scalars:** `{{Field}}` is replaced everywhere.
-   - **Line items:** the single table row `<w:tr>` containing any
-     `{{line.<col>}}` token is duplicated once per line; tokens are replaced per
-     line. Available line columns: `line_no, sku, description, qty, unit_price,
-     line_net`.
+   - **Repeating rows:** the single `<w:tr>` containing `{{line.<col>}}` is
+     cloned per line item; the one containing `{{schedule.<col>}}` per
+     payment-schedule installment (`due_date`, `amount`, `description`, `paid_amount`, `status`) (`repeatPrefix`). Columns = the child
+     entity's fields.
    - Any leftover `{{...}}` is blanked so it never shows in the output.
 3. `convert.go` runs `soffice --headless --convert-to pdf` to produce the PDF.
 
@@ -46,7 +58,12 @@ generation works from any working directory with no setup. Resolution order in
   placeholders in exactly one table row. In Docker, mount the dir and set
   `TEMPLATES_DIR`.
 
-## Available scalar fields
+## Available fields
+
+The live list (with descriptions, grouped by record) is
+`GET /api/v1/templates/fields`, built by `FieldCatalogFor` in `fields.go` and
+shown in Team → Document templates → "Available fields". The original flat
+scalars, kept for templates already in production:
 
 `Invoice_ID, Legal_Entity, Account_ID, Account_Name, Buying_Entity_Name,
 Buying_Entity_Address, Legal_Entity_Name, Legal_Entity_Address,
@@ -57,8 +74,10 @@ Quote_Description, Net_Total, VAT_Total, Grand_Total, VAT_Pct`
 (These match the field names from the original `83_/84_Print_*_Data` sheets, so
 your existing SharePoint templates work after renaming nothing.)
 
-To add a new scalar, add it to the `values` map in `Service.buildValues`
-(`service.go`) and reference `{{Your_Field}}` in the template.
+To expose a new field, add it to the catalog — it's available as
+`{{prefix.field}}` immediately. To make a new entity reachable, add it to
+`scalarPrefix`; a new repeating child collection, to `repeatPrefix`. Flat
+legacy-style scalars go in `Service.buildValues` (and `FieldCatalog`).
 
 ## Add a new document kind
 
@@ -71,7 +90,8 @@ To add a new scalar, add it to the `values` map in `Service.buildValues`
 
 - DOCX path needs no LibreOffice and is unit-tested:
   `go test ./internal/documents/...` and the integration tests
-  `TestGenerateOfferDocx` / `TestGenerateIGTRDocx`.
+  `TestGenerateOfferDocx` / `TestGenerateIGTRDocx` /
+  `TestGenerateFromQuoteAndNamespacedFields`.
 - For PDF, you need `soffice` on PATH (present in the devcontainer and the
   backend image). Smoke test:
   `GET /api/v1/documents/igtr/<invoice_id>?format=pdf`.

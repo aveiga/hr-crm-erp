@@ -99,92 +99,44 @@ func TestDepartmentsTeamsAndPeopleCostFields(t *testing.T) {
 	}
 }
 
-// Contracting Company on People points at a Legal Entity; on SAR it is a
-// read-only reference (auto-filled in the UI from the chosen person).
+// Contracting Company on People points at a Legal Entity. SAR tracking was
+// removed from the catalog, so its module must no longer be served.
 func TestContractingCompanyIsLegalEntity(t *testing.T) {
 	token, _ := signup(t, "Contracting Co")
 
 	le := do(t, "POST", "/api/v1/entities/legal_entities", token, map[string]any{"legal_name": "Contractor Corp SA"})
 	leID := dataObj(t, le)["id"].(string)
 
-	// Person's contracting company references the legal entity.
 	person := do(t, "POST", "/api/v1/entities/people", token, map[string]any{
 		"full_name": "Bob Contractor", "worker_type": "Contractor", "contracting_company_id": leID,
 	})
 	if person.Status != http.StatusCreated {
 		t.Fatalf("create person failed: %d %s", person.Status, person.Raw)
 	}
-	personID := dataObj(t, person)["id"].(string)
 	if dataObj(t, person)["contracting_company_id"] != leID {
 		t.Fatalf("person contracting_company_id not saved")
 	}
 
-	// SAR stores the same reference (the UI auto-fills it from the person).
-	sar := do(t, "POST", "/api/v1/entities/sar_tracking", token, map[string]any{
-		"person_id": personID, "contracting_company_id": leID,
-	})
-	if sar.Status != http.StatusCreated {
-		t.Fatalf("create SAR failed: %d %s", sar.Status, sar.Raw)
-	}
-	if dataObj(t, sar)["contracting_company_id"] != leID {
-		t.Fatalf("SAR contracting_company_id not saved")
+	if sar := do(t, "GET", "/api/v1/entities/sar_tracking", token, nil); sar.Status != http.StatusNotFound {
+		t.Fatalf("SAR tracking should be gone (404), got %d", sar.Status)
 	}
 
-	// Catalog: both point at legal_entities; SAR's is read-only. On SAR, the
-	// rate is read-only (auto-filled from the person) and internal_validation
-	// is a boolean checkbox.
 	meta := do(t, "GET", "/api/v1/meta", token, nil)
 	ents, _ := meta.Body["entities"].([]any)
-	var peopleOK, sarOK, rateRO, amountRO, validationBool, personContractorOnly bool
+	var peopleOK bool
 	for _, e := range ents {
 		m := e.(map[string]any)
+		if m["key"] == "sar_tracking" || m["group"] == "SAR" {
+			t.Fatalf("SAR should not be in the catalog")
+		}
 		for _, f := range m["fields"].([]any) {
 			fm := f.(map[string]any)
 			if m["key"] == "people" && fm["key"] == "contracting_company_id" && fm["ref"] == "legal_entities" {
 				peopleOK = true
 			}
-			if m["key"] == "sar_tracking" {
-				switch fm["key"] {
-				case "person_id":
-					if fm["option_filter_field"] == "worker_type" && fm["option_filter_value"] == "Contractor" {
-						personContractorOnly = true
-					}
-				case "contracting_company_id":
-					if fm["ref"] == "legal_entities" && fm["read_only"] == true {
-						sarOK = true
-					}
-				case "rate":
-					if fm["read_only"] == true {
-						rateRO = true
-					}
-				case "amount":
-					if fm["read_only"] == true {
-						amountRO = true
-					}
-				case "internal_validation":
-					if fm["type"] == "bool" {
-						validationBool = true
-					}
-				}
-			}
 		}
 	}
 	if !peopleOK {
 		t.Fatalf("people.contracting_company_id should reference legal_entities")
-	}
-	if !sarOK {
-		t.Fatalf("sar contracting_company_id should be a read-only legal_entities ref")
-	}
-	if !rateRO {
-		t.Fatalf("sar rate should be read-only")
-	}
-	if !amountRO {
-		t.Fatalf("sar amount should be read-only")
-	}
-	if !validationBool {
-		t.Fatalf("sar internal_validation should be a bool field")
-	}
-	if !personContractorOnly {
-		t.Fatalf("sar person_id should be filtered to Contractor worker_type")
 	}
 }

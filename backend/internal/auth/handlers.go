@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -109,6 +110,10 @@ func (h *Handlers) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, err)
 		return
 	}
+	// Best effort: a failed timestamp must not block sign-in.
+	if err := h.store.TouchLastLogin(r.Context(), u.ID); err != nil {
+		slog.Warn("record last login", "err", err)
+	}
 	httpx.JSON(w, http.StatusOK, authResponse{
 		Token:       token,
 		User:        u,
@@ -188,6 +193,9 @@ func (h *Handlers) CreateInvite(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Email string `json:"email"`
 		Role  string `json:"role"`
+		// AllowedGroups is the section access applied on acceptance; omitted or
+		// null => full access (the original behaviour).
+		AllowedGroups *[]string `json:"allowed_groups"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Fail(w, err)
@@ -200,7 +208,26 @@ func (h *Handlers) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "bad_email", "a valid email is required"))
 		return
 	}
-	inv, err := h.store.CreateInvite(r.Context(), p.TenantID, p.UserID, req.Email, req.Role)
+	if req.Role == "owner" && p.Role != "owner" {
+		httpx.Fail(w, memberError(ErrOwnerOnly))
+		return
+	}
+	// Re-inviting an existing owner (which may change their role) is also
+	// owner-only.
+	if p.Role != "owner" {
+		isOwner, err := h.store.IsOwnerEmail(r.Context(), p.TenantID, req.Email)
+		if err != nil {
+			httpx.Fail(w, err)
+			return
+		}
+		if isOwner {
+			httpx.Fail(w, memberError(ErrOwnerOnly))
+			return
+		}
+	}
+	groups := h.sectionGroups(req.Role, req.AllowedGroups)
+	inv, err := h.store.CreateInvite(r.Context(), p.TenantID, p.UserID, req.Email, req.Role, groups,
+		time.Now().Add(InviteTTL))
 	if err != nil {
 		httpx.Fail(w, err)
 		return
@@ -257,20 +284,7 @@ func (h *Handlers) SetPermissions(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "bad_user", "user_id is required"))
 		return
 	}
-	var groups []string
-	if req.Groups != nil {
-		// Keep only known sections, preserving catalog order.
-		known := map[string]bool{}
-		for _, g := range *req.Groups {
-			known[g] = true
-		}
-		groups = []string{}
-		for _, g := range h.groups {
-			if known[g] {
-				groups = append(groups, g)
-			}
-		}
-	}
+	groups := h.cleanGroups(req.Groups)
 	if err := h.store.SetMemberGroups(r.Context(), p.TenantID, req.UserID, groups); err != nil {
 		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "set_failed", err.Error()))
 		return
@@ -292,7 +306,13 @@ func (h *Handlers) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 	var hash string
 	if req.Password != "" {
 		if len(req.Password) < 8 {
-			httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "weak_password", "password must be at least 8 characters"))
+			const msg = "password must be at least 8 characters"
+			// Validation failures count as failed attempts on the invite too.
+			if err := h.store.RecordInviteFailureByToken(r.Context(), req.Token, msg); err != nil {
+				httpx.Fail(w, err)
+				return
+			}
+			httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "weak_password", msg))
 			return
 		}
 		var err error
@@ -302,8 +322,13 @@ func (h *Handlers) AcceptInvite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	u, t, role, err := h.store.AcceptInvite(r.Context(), req.Token, req.FullName, hash)
+	var ie *InviteError
+	if errors.As(err, &ie) {
+		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "invite_failed", ie.Msg))
+		return
+	}
 	if err != nil {
-		httpx.Fail(w, httpx.Errorf(http.StatusBadRequest, "invite_failed", err.Error()))
+		httpx.Fail(w, err)
 		return
 	}
 	h.respondAuth(w, u, t, role)

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"hrcrm/internal/httpx"
+	"hrcrm/internal/resource"
 )
 
 // TemplateStore persists per-tenant uploaded Word templates.
@@ -83,16 +84,20 @@ func (s *TemplateStore) Delete(ctx context.Context, tenantID, id uuid.UUID) erro
 }
 
 // TemplateHandlers exposes template management endpoints.
-type TemplateHandlers struct{ store *TemplateStore }
+type TemplateHandlers struct {
+	store *TemplateStore
+	reg   *resource.Registry
+}
 
-func NewTemplateHandlers(store *TemplateStore) *TemplateHandlers {
-	return &TemplateHandlers{store: store}
+func NewTemplateHandlers(store *TemplateStore, reg *resource.Registry) *TemplateHandlers {
+	return &TemplateHandlers{store: store, reg: reg}
 }
 
 // GET /api/v1/templates/fields -> the placeholders available to templates and
-// their descriptions. Static (no tenant data), so any authenticated user can read it.
+// their descriptions. Derived from the catalog (no tenant data), so any
+// authenticated user can read it.
 func (h *TemplateHandlers) Fields(w http.ResponseWriter, r *http.Request) {
-	httpx.JSON(w, http.StatusOK, FieldCatalog())
+	httpx.JSON(w, http.StatusOK, FieldCatalogFor(h.reg))
 }
 
 // GET /api/v1/templates?kind=offer|igtr

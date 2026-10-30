@@ -48,8 +48,11 @@ func TestMain(m *testing.M) {
 	cfg.Env = "test"
 	cfg.JWTSecret = "test-secret"
 	cfg.JWTTTL = time.Hour
-	cfg.BcryptCost = 4 // fast hashing in tests
+	cfg.BcryptCost = 4    // fast hashing in tests
 	cfg.TemplatesDir = "" // use templates embedded in the binary
+	fakeAzure := httptest.NewServer(fakeAzureHandler())
+	defer fakeAzure.Close()
+	cfg.AzureLoginURL, cfg.AzureManagementURL = fakeAzure.URL, fakeAzure.URL
 
 	c, _ := cache.New("") // no-op cache in tests
 	srv, err := server.New(ctx, cfg, pool, c)

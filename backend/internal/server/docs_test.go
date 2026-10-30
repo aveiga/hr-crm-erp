@@ -118,58 +118,53 @@ func TestInvoiceLegalEntityAutofill(t *testing.T) {
 	}
 }
 
-func TestConvertQuoteToOrderToInvoice(t *testing.T) {
+// Sales Orders were retired: a quote converts straight into a service
+// agreement (entity "invoices"), lines and pricing copied, quote linked.
+func TestConvertQuoteToServiceAgreement(t *testing.T) {
 	token, _ := signup(t, "Convert Co")
 	le := do(t, "POST", "/api/v1/entities/legal_entities", token, map[string]any{
-		"legal_name": "Seller Ltd", "billing_address": "HQ Street 1",
+		"legal_name": "Seller Ltd", "billing_address": "HQ Street 1", "entity_type": "Own", "default_currency": "EUR",
 	})
 	leID := dataObj(t, le)["id"].(string)
 
 	quote := do(t, "POST", "/api/v1/docs/quotes", token, map[string]any{
-		"description": "Big Deal", "legal_entity_id": leID, "currency": "EUR", "vat_pct": 23, "markup_pct": 10,
+		"description": "Big Deal", "legal_entity_id": leID, "vat_pct": 23, "markup_pct": 10,
 		"payment_terms_days": 30,
 		"lines": []map[string]any{
 			{"sku": "SVC", "description": "Consulting", "qty": 10, "unit_price": 100},
 		},
 	})
 	quoteID := dataObj(t, quote)["id"].(string)
-
-	// Quote -> Sales Order
-	toOrder := do(t, "POST", "/api/v1/docs/quotes/"+quoteID+"/convert", token, nil)
-	if toOrder.Status != http.StatusCreated {
-		t.Fatalf("convert to order failed: %d %s", toOrder.Status, toOrder.Raw)
-	}
-	if toOrder.Body["entity"] != "sales_orders" {
-		t.Fatalf("expected sales_orders, got %v", toOrder.Body["entity"])
-	}
-	order := dataObj(t, toOrder)
-	orderID := order["id"].(string)
-	if order["quote_description"] != "Big Deal" {
-		t.Fatalf("description not carried to order: %v", order["quote_description"])
-	}
-	if got := numField(t, order, "grand_total"); got != 1353 {
-		t.Fatalf("order grand_total want 1353, got %v", got)
-	}
-	// lines copied
-	og := do(t, "GET", "/api/v1/docs/sales_orders/"+orderID, token, nil)
-	if ol, _ := og.Body["lines"].([]any); len(ol) != 1 {
-		t.Fatalf("order should have 1 copied line, got %d", len(ol))
+	// Currency derives from the seller's default when the quote has no account.
+	if dataObj(t, quote)["currency"] != "EUR" {
+		t.Fatalf("quote currency not derived: %v", dataObj(t, quote)["currency"])
 	}
 
-	// Sales Order -> Invoice
-	toInv := do(t, "POST", "/api/v1/docs/sales_orders/"+orderID+"/convert", token, nil)
-	if toInv.Status != http.StatusCreated || toInv.Body["entity"] != "invoices" {
-		t.Fatalf("convert to invoice failed: %d %s", toInv.Status, toInv.Raw)
+	toSA := do(t, "POST", "/api/v1/docs/quotes/"+quoteID+"/convert", token, nil)
+	if toSA.Status != http.StatusCreated || toSA.Body["entity"] != "invoices" {
+		t.Fatalf("convert to service agreement failed: %d %s", toSA.Status, toSA.Raw)
 	}
-	invoice := dataObj(t, toInv)
-	if invoice["legal_entity_name"] != "Seller Ltd" {
-		t.Fatalf("invoice legal_entity_name not derived: %v", invoice["legal_entity_name"])
+	sa := dataObj(t, toSA)
+	if sa["quote_description"] != "Big Deal" || sa["quote_id"] != quoteID || sa["currency"] != "EUR" {
+		t.Fatalf("agreement not carried from quote: %v", sa)
 	}
-	if invoice["sales_order_id"] != orderID {
-		t.Fatalf("invoice should reference the order: %v", invoice["sales_order_id"])
+	if sa["legal_entity_name"] != "Seller Ltd" {
+		t.Fatalf("agreement legal_entity_name not derived: %v", sa["legal_entity_name"])
 	}
-	if got := numField(t, invoice, "grand_total"); got != 1353 {
-		t.Fatalf("invoice grand_total want 1353, got %v", got)
+	if got := numField(t, sa, "grand_total"); got != 1353 {
+		t.Fatalf("agreement grand_total want 1353, got %v", got)
+	}
+	g := do(t, "GET", "/api/v1/docs/invoices/"+sa["id"].(string), token, nil)
+	if l, _ := g.Body["lines"].([]any); len(l) != 1 {
+		t.Fatalf("agreement should have 1 copied line, got %d", len(l))
+	}
+	// The quote now shows its agreement's status.
+	q := do(t, "GET", "/api/v1/entities/quotes/"+quoteID, token, nil)
+	if dataObj(t, q)["agreement_status"] != "Draft" {
+		t.Fatalf("quote agreement_status not synced: %v", dataObj(t, q)["agreement_status"])
+	}
+	if r := do(t, "GET", "/api/v1/entities/sales_orders", token, nil); r.Status != http.StatusNotFound {
+		t.Fatalf("sales orders should be gone, got %d", r.Status)
 	}
 }
 

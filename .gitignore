@@ -26,3 +26,6 @@ yarn-error.log*
 
 # Original Excel sources (keep templates/, ignore working copies)
 *.xlsm~
+
+# TypeScript incremental build cache
+*.tsbuildinfo

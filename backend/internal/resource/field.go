@@ -50,9 +50,23 @@ type Field struct {
 	// is a constant, not a sibling-dependent value.
 	OptionFilterField string `json:"option_filter_field,omitempty"`
 	OptionFilterValue string `json:"option_filter_value,omitempty"`
-	ReadOnly          bool   `json:"read_only,omitempty"` // computed/auto-filled; not user-editable
-	InList            bool   `json:"in_list"`             // show in the table view
-	Help              string `json:"help,omitempty"`
+	// Mirrored field: when the sibling ref FillFrom is set, this field's value
+	// is copied from the referenced row's FillField and is read-only (e.g. a
+	// person's country from their location). With FillFrom empty it's a normal
+	// editable field. Enforced server-side on every write (see rules.go).
+	FillFrom  string `json:"fill_from,omitempty"`
+	FillField string `json:"fill_field,omitempty"`
+	// Conditionally disabled: when sibling DisabledWhen equals DisabledValue the
+	// field is disabled in the UI and cleared on save (e.g. an internal
+	// person has no contracting company).
+	DisabledWhen  string `json:"disabled_when,omitempty"`
+	DisabledValue string `json:"disabled_value,omitempty"`
+	// Default is applied on create when no value is given (and pre-filled in
+	// the UI's new-record form).
+	Default  string `json:"default,omitempty"`
+	ReadOnly bool   `json:"read_only,omitempty"` // computed/auto-filled; not user-editable
+	InList   bool   `json:"in_list"`             // show in the table view
+	Help     string `json:"help,omitempty"`
 }
 
 // Child links a parent document to a sub-collection (e.g. quotes -> quote_lines).
@@ -60,6 +74,14 @@ type Child struct {
 	Entity string `json:"entity"` // child entity key, e.g. "quote_lines"
 	FK     string `json:"fk"`     // child field linking to the parent, e.g. "quote_id"
 	Label  string `json:"label"`  // UI label, e.g. "Line Items"
+}
+
+// View is a saved list filter offered on an entity's list page, e.g. "Overdue".
+// Query uses the list endpoint's filter params (f_, fin_, fmin_, fmax_), whose
+// values may use date tokens (@today, @today-1, @month) and @empty.
+type View struct {
+	Label string `json:"label"`
+	Query string `json:"query"`
 }
 
 // Entity describes a business module.
@@ -73,7 +95,11 @@ type Entity struct {
 	Hidden     bool    `json:"hidden"`    // not shown in nav (managed via its parent)
 	ReadOnly   bool    `json:"read_only"` // shown in nav as a searchable list, but not writable here
 	Children   []Child `json:"children,omitempty"`
-	Fields     []Field `json:"fields"`
+	Views      []View  `json:"views,omitempty"`
+	// Columns lists the fields shown in the list view, in order. Empty means
+	// the first in-list fields plus the money totals.
+	Columns []string `json:"columns,omitempty"`
+	Fields  []Field  `json:"fields"`
 }
 
 func (e Entity) Table() string { return "ent_" + e.Key }
@@ -177,6 +203,9 @@ func intf(key, label string) Field { return Field{Key: key, Label: label, Type: 
 func date(key, label string) Field {
 	return Field{Key: key, Label: label, Type: TypeDate, InList: true}
 }
+func datetime(key, label string) Field {
+	return Field{Key: key, Label: label, Type: TypeDateTime, InList: true}
+}
 func boolf(key, label string) Field {
 	return Field{Key: key, Label: label, Type: TypeBool, InList: true}
 }
@@ -191,9 +220,10 @@ func lookup(key, label, source, valueField, labelField string) Field {
 		ValueField: valueField, LabelField: labelField, InList: true}
 }
 
-func req(f Field) Field    { f.Required = true; return f }
-func hidden(f Field) Field { f.InList = false; return f }
-func ro(f Field) Field     { f.ReadOnly = true; return f }
+func req(f Field) Field                   { f.Required = true; return f }
+func withHelp(f Field, help string) Field { f.Help = help; return f }
+func hidden(f Field) Field                { f.InList = false; return f }
+func ro(f Field) Field                    { f.ReadOnly = true; return f }
 
 // filteredBy makes a ref/lookup depend on a sibling field: options are limited
 // to target rows whose targetField equals this record's siblingKey value.
@@ -202,6 +232,23 @@ func filteredBy(f Field, siblingKey, targetField string) Field {
 	f.FilterField = targetField
 	return f
 }
+
+// filledFrom mirrors a field from the row a sibling ref points at (read-only
+// while the ref is set).
+func filledFrom(f Field, siblingRef, sourceField string) Field {
+	f.FillFrom = siblingRef
+	f.FillField = sourceField
+	return f
+}
+
+// disabledWhen disables and clears a field while a sibling equals value.
+func disabledWhen(f Field, sibling, value string) Field {
+	f.DisabledWhen = sibling
+	f.DisabledValue = value
+	return f
+}
+
+func withDefault(f Field, v string) Field { f.Default = v; return f }
 
 // optionWhere restricts a ref/lookup's selectable options to target rows whose
 // targetField equals a constant value (e.g. only "Contractor" people).

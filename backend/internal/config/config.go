@@ -22,6 +22,15 @@ type Config struct {
 	CORSOrigin    string        // allowed browser origin for the SPA
 	BcryptCost    int           // password hashing cost
 	MigrateOnBoot bool          // run migrations automatically at startup
+	// Secrets stored in the database (Azure client secrets) are encrypted
+	// with this key. Defaults to JWT_SECRET; changing it orphans stored secrets.
+	SecretsKey string
+	// Azure Cost Management sync. AzureSyncEvery = 0 disables the daily job
+	// (manual "Sync now" still works). The URLs are overridable for tests and
+	// sovereign clouds.
+	AzureSyncEvery     time.Duration
+	AzureLoginURL      string
+	AzureManagementURL string
 }
 
 func Load() Config {
@@ -37,7 +46,12 @@ func Load() Config {
 		CORSOrigin:    getenv("CORS_ORIGIN", "http://localhost:3000"),
 		BcryptCost:    getint("BCRYPT_COST", 12),
 		MigrateOnBoot: getbool("MIGRATE_ON_BOOT", true),
+
+		AzureSyncEvery:     getdur("AZURE_SYNC_EVERY", 24*time.Hour),
+		AzureLoginURL:      getenv("AZURE_LOGIN_URL", "https://login.microsoftonline.com"),
+		AzureManagementURL: getenv("AZURE_MANAGEMENT_URL", "https://management.azure.com"),
 	}
+	c.SecretsKey = getenv("SECRETS_KEY", c.JWTSecret)
 	return c
 }
 
@@ -51,8 +65,6 @@ func (c Config) Validate() error {
 	}
 	return nil
 }
-
-func (c Config) IsProd() bool { return c.Env == "production" }
 
 func getenv(k, def string) string {
 	if v, ok := os.LookupEnv(k); ok && v != "" {

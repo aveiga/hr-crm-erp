@@ -22,7 +22,7 @@ export default function DashboardPage() {
       <h1 className="text-2xl font-bold">Dashboard</h1>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Kpi label="Invoiced (AR)" value={money(data?.ar?.invoiced ?? 0)} tone="brand" />
+        <Kpi label="Contracted (AR)" value={money(data?.ar?.invoiced ?? 0)} tone="brand" />
         <Kpi label="Outstanding (AR)" value={money(data?.ar?.outstanding ?? 0)} tone="amber" />
         <Kpi label="Overdue (AR)" value={money(data?.ar?.overdue ?? 0)} tone="red" />
         <Kpi label="Weighted Pipeline" value={money(data?.pipeline_weighted ?? 0)} tone="green" />

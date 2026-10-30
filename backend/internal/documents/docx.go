@@ -31,8 +31,17 @@ var builtinTemplates embed.FS
 // body. Scalars: {{Key}}. Line items: the single <w:tr> containing any
 // {{line.col}} placeholder is duplicated once per line.
 func renderBody(body string, values map[string]string, lines []map[string]string) string {
+	return renderBodyRepeats(body, values, map[string][]map[string]string{"line": lines})
+}
+
+// renderBodyRepeats is renderBody for any number of repeating row groups,
+// keyed by placeholder prefix: "line" fills the {{line.*}} row, "schedule" the
+// {{schedule.*}} row, and so on. Each group's template row is cloned per row.
+func renderBodyRepeats(body string, values map[string]string, repeats map[string][]map[string]string) string {
 	body = normalizePlaceholders(body)
-	body = expandLineRows(body, lines)
+	for prefix, rows := range repeats {
+		body = expandRows(body, prefix, rows)
+	}
 	return replaceScalars(body, values)
 }
 
@@ -52,35 +61,42 @@ func normalizePlaceholders(body string) string {
 }
 
 var trRe = regexp.MustCompile(`(?s)<w:tr\b.*?</w:tr>`)
-var lineTokenRe = regexp.MustCompile(`\{\{line\.([a-zA-Z0-9_]+)\}\}`)
+var rowTokenRe = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\}\}`)
 
-func expandLineRows(body string, lines []map[string]string) string {
-	// Find the template row: the first <w:tr> that contains a {{line.*}} token.
+// expandRows clones the first <w:tr> containing a {{prefix.*}} token once per
+// row, filling that row's tokens. Other placeholders in the row are left for
+// the scalar pass.
+func expandRows(body, prefix string, rows []map[string]string) string {
+	marker := "{{" + prefix + "."
 	for _, r := range trRe.FindAllStringIndex(body, -1) {
 		row := body[r[0]:r[1]]
-		if strings.Contains(row, "{{line.") {
-			var b strings.Builder
-			for _, ln := range lines {
-				b.WriteString(lineTokenRe.ReplaceAllStringFunc(row, func(tok string) string {
-					m := lineTokenRe.FindStringSubmatch(tok)
-					return xmlEscape(ln[m[1]])
-				}))
-			}
-			return body[:r[0]] + b.String() + body[r[1]:]
+		if !strings.Contains(row, marker) {
+			continue
 		}
+		var b strings.Builder
+		for _, ln := range rows {
+			b.WriteString(rowTokenRe.ReplaceAllStringFunc(row, func(tok string) string {
+				m := rowTokenRe.FindStringSubmatch(tok)
+				if m[1] != prefix {
+					return tok
+				}
+				return xmlEscape(ln[m[2]])
+			}))
+		}
+		return body[:r[0]] + b.String() + body[r[1]:]
 	}
 	return body
 }
 
-// leftoverRe matches any unresolved {{...}} placeholder (scalar or line).
-var leftoverRe = regexp.MustCompile(`\{\{[a-zA-Z0-9_.]+\}\}`)
+// scalarRe matches any {{...}} placeholder left after row expansion.
+var scalarRe = regexp.MustCompile(`\{\{([a-zA-Z0-9_.]+)\}\}`)
 
+// replaceScalars fills every placeholder in one pass; unknown ones (including
+// repeating-row tokens with no rows) are blanked so they don't show.
 func replaceScalars(body string, values map[string]string) string {
-	for k, v := range values {
-		body = strings.ReplaceAll(body, "{{"+k+"}}", xmlEscape(v))
-	}
-	// Blank any leftover placeholders so they don't show in the output.
-	return leftoverRe.ReplaceAllString(body, "")
+	return scalarRe.ReplaceAllStringFunc(body, func(tok string) string {
+		return xmlEscape(values[scalarRe.FindStringSubmatch(tok)[1]])
+	})
 }
 
 func xmlEscape(s string) string {
@@ -91,10 +107,10 @@ func xmlEscape(s string) string {
 // assembleDocx wraps a word/document.xml body into a minimal but valid .docx.
 func assembleDocx(documentXML string) ([]byte, error) {
 	files := map[string]string{
-		"[Content_Types].xml": contentTypesXML,
-		"_rels/.rels":         relsXML,
-		"word/document.xml":   documentXML,
-		"word/styles.xml":     stylesXML,
+		"[Content_Types].xml":          contentTypesXML,
+		"_rels/.rels":                  relsXML,
+		"word/document.xml":            documentXML,
+		"word/styles.xml":              stylesXML,
 		"word/_rels/document.xml.rels": docRelsXML,
 	}
 	return zipFiles(files)
@@ -103,6 +119,12 @@ func assembleDocx(documentXML string) ([]byte, error) {
 // renderDocxZip rewrites word/document.xml inside an existing .docx, preserving
 // all other parts (styles, headers, fonts, images).
 func renderDocxZip(src []byte, values map[string]string, lines []map[string]string) ([]byte, error) {
+	return renderDocxZipRepeats(src, values, map[string][]map[string]string{"line": lines})
+}
+
+// renderDocxZipRepeats is renderDocxZip with any number of repeating row
+// groups (see renderBodyRepeats). Headers and footers are filled too.
+func renderDocxZipRepeats(src []byte, values map[string]string, repeats map[string][]map[string]string) ([]byte, error) {
 	zr, err := zip.NewReader(bytes.NewReader(src), int64(len(src)))
 	if err != nil {
 		return nil, fmt.Errorf("read docx: %w", err)
@@ -119,8 +141,8 @@ func renderDocxZip(src []byte, values map[string]string, lines []map[string]stri
 		if err != nil {
 			return nil, err
 		}
-		if f.Name == "word/document.xml" {
-			data = []byte(renderBody(string(data), values, lines))
+		if f.Name == "word/document.xml" || isHeaderFooter(f.Name) {
+			data = []byte(renderBodyRepeats(string(data), values, repeats))
 		}
 		fw, err := zw.Create(f.Name)
 		if err != nil {
@@ -134,6 +156,10 @@ func renderDocxZip(src []byte, values map[string]string, lines []map[string]stri
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func isHeaderFooter(name string) bool {
+	return strings.HasPrefix(name, "word/header") || strings.HasPrefix(name, "word/footer")
 }
 
 func zipFiles(files map[string]string) ([]byte, error) {

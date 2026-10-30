@@ -2,7 +2,9 @@ package resource
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 	"hrcrm/internal/httpx"
@@ -67,12 +69,7 @@ func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
 		Desc:     q.Get("dir") == "desc",
 		Filters:  map[string]string{},
 	}
-	// Any query param matching a field becomes an equality filter.
-	for _, f := range e.Fields {
-		if v := q.Get("f_" + f.Key); v != "" {
-			opt.Filters[f.Key] = v
-		}
-	}
+	ParseFilters(e, q, &opt)
 	res, err := h.repo.List(r.Context(), e, p.TenantID, opt)
 	if err != nil {
 		httpx.Fail(w, err)
@@ -186,14 +183,39 @@ func splitLines(body map[string]any) (header map[string]any, lines []map[string]
 		}
 		header[k] = v
 	}
-	if raw, ok := body["lines"].([]any); ok {
-		for _, item := range raw {
+	return header, rowsOf(body["lines"])
+}
+
+// splitDoc is splitLines plus the document's secondary child collections, sent
+// as arrays keyed by child entity (e.g. "invoice_schedule": [...]). Only the
+// collections present in the body are returned, so omitting one keeps it.
+func splitDoc(e Entity, body map[string]any) (header map[string]any, lines []map[string]any, extra map[string][]map[string]any) {
+	header, lines = splitLines(body)
+	for _, c := range e.Children[1:] {
+		if raw, ok := body[c.Entity]; ok {
+			if extra == nil {
+				extra = map[string][]map[string]any{}
+			}
+			extra[c.Entity] = rowsOf(raw)
+			delete(header, c.Entity)
+		}
+	}
+	return header, lines, extra
+}
+
+func rowsOf(raw any) []map[string]any {
+	var rows []map[string]any
+	if arr, ok := raw.([]any); ok {
+		for _, item := range arr {
 			if m, ok := item.(map[string]any); ok {
-				lines = append(lines, m)
+				rows = append(rows, m)
 			}
 		}
 	}
-	return header, lines
+	if raw != nil && rows == nil {
+		rows = []map[string]any{} // explicit empty array clears the collection
+	}
+	return rows
 }
 
 // POST /api/v1/docs/{entity}  -> create a document (header + lines).
@@ -213,8 +235,8 @@ func (h *Handlers) DocCreate(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, err)
 		return
 	}
-	header, lines := splitLines(body)
-	row, err := h.docs.Save(r.Context(), e, p.TenantID, nil, header, lines)
+	header, lines, extra := splitDoc(e, body)
+	row, err := h.docs.SaveDoc(r.Context(), e, p.TenantID, nil, header, lines, extra)
 	if err != nil {
 		httpx.Fail(w, err)
 		return
@@ -244,8 +266,8 @@ func (h *Handlers) DocUpdate(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, err)
 		return
 	}
-	header, lines := splitLines(body)
-	row, err := h.docs.Save(r.Context(), e, p.TenantID, &id, header, lines)
+	header, lines, extra := splitDoc(e, body)
+	row, err := h.docs.SaveDoc(r.Context(), e, p.TenantID, &id, header, lines, extra)
 	if err != nil {
 		httpx.Fail(w, err)
 		return
@@ -280,7 +302,56 @@ func (h *Handlers) DocGet(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"data": row, "lines": lines})
+	out := map[string]any{"data": row, "lines": lines}
+	children, err := h.docs.LoadChildren(r.Context(), e, p.TenantID, id)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	if children != nil {
+		out["children"] = children
+	}
+	httpx.JSON(w, http.StatusOK, out)
+}
+
+// POST /api/v1/docs/{entity}/{id}/duplicate  -> copy a document (header, lines
+// and other child collections) into a new draft.
+func (h *Handlers) DocDuplicate(w http.ResponseWriter, r *http.Request) {
+	e, p, ok := h.resolve(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Fail(w, httpx.ErrNotFound)
+		return
+	}
+	row, err := h.docs.Duplicate(r.Context(), e, p.TenantID, id)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"entity": e.Key, "data": row})
+}
+
+// GET /api/v1/entities/{entity}/{id}/related  -> upstream links and downstream
+// records (with statuses) for navigating the document chain both ways.
+func (h *Handlers) Related(w http.ResponseWriter, r *http.Request) {
+	e, p, ok := h.resolve(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.Fail(w, httpx.ErrNotFound)
+		return
+	}
+	up, down, err := h.docs.Related(r.Context(), p, e, p.TenantID, id)
+	if err != nil {
+		httpx.Fail(w, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"upstream": up, "downstream": down})
 }
 
 // POST /api/v1/docs/{entity}/{id}/convert  -> advance a record to the next
@@ -339,6 +410,26 @@ func (h *Handlers) Dashboard(w http.ResponseWriter, r *http.Request) {
 		out["pipeline_weighted"] = pipeline
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+// ParseFilters reads the list filter params: f_<field>=v (equality, or
+// @empty), fin_<field>=a,b (any of), fmin_/fmax_<field>=v (inclusive range).
+func ParseFilters(e Entity, q url.Values, opt *ListOptions) {
+	opt.In, opt.Min, opt.Max = map[string][]string{}, map[string]string{}, map[string]string{}
+	for _, f := range e.Fields {
+		if v := q.Get("f_" + f.Key); v != "" {
+			opt.Filters[f.Key] = v
+		}
+		if v := q.Get("fin_" + f.Key); v != "" {
+			opt.In[f.Key] = strings.Split(v, ",")
+		}
+		if v := q.Get("fmin_" + f.Key); v != "" {
+			opt.Min[f.Key] = v
+		}
+		if v := q.Get("fmax_" + f.Key); v != "" {
+			opt.Max[f.Key] = v
+		}
+	}
 }
 
 func atoiDefault(s string, def int) int {

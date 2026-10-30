@@ -316,6 +316,16 @@ func (s *Store) SetMemberGroups(ctx context.Context, tenantID, userID uuid.UUID,
 	return nil
 }
 
+// Invite statuses, derived from the lifecycle columns.
+const (
+	InvitePending  = "pending"
+	InviteAccepted = "accepted"
+	InviteExpired  = "expired"
+	InviteRevoked  = "revoked"
+)
+
+// Invite is an invitation to join a tenant. The original fields (id … accepted)
+// keep their shape; the rest were added for the user manager.
 type Invite struct {
 	ID       uuid.UUID `json:"id"`
 	TenantID uuid.UUID `json:"tenant_id"`
@@ -323,31 +333,78 @@ type Invite struct {
 	Role     string    `json:"role"`
 	Token    string    `json:"token"`
 	Accepted bool      `json:"accepted"`
+
+	AllowedGroups  []string   `json:"allowed_groups"` // nil => full access on acceptance
+	Status         string     `json:"status"`         // pending | accepted | expired | revoked
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at"` // nil => never expires (pre-expiry invites)
+	AcceptedAt     *time.Time `json:"accepted_at"`
+	RevokedAt      *time.Time `json:"revoked_at"`
+	LastError      *string    `json:"last_error"`
+	FailedAttempts int        `json:"failed_attempts"`
+	LastAttemptAt  *time.Time `json:"last_attempt_at"`
 }
 
-func (s *Store) CreateInvite(ctx context.Context, tenantID, invitedBy uuid.UUID, email, role string) (Invite, error) {
+const inviteCols = `id, tenant_id, email, role, token, accepted_at, allowed_groups, created_at,
+	expires_at, revoked_at, last_error, failed_attempts, last_attempt_at`
+
+func scanInvite(row pgx.Row) (Invite, error) {
+	var i Invite
+	err := row.Scan(&i.ID, &i.TenantID, &i.Email, &i.Role, &i.Token, &i.AcceptedAt, &i.AllowedGroups,
+		&i.CreatedAt, &i.ExpiresAt, &i.RevokedAt, &i.LastError, &i.FailedAttempts, &i.LastAttemptAt)
+	if err != nil {
+		return Invite{}, err
+	}
+	i.Accepted = i.AcceptedAt != nil
+	i.Status = inviteStatus(i, time.Now())
+	return i, nil
+}
+
+func inviteStatus(i Invite, now time.Time) string {
+	switch {
+	case i.AcceptedAt != nil:
+		return InviteAccepted
+	case i.RevokedAt != nil:
+		return InviteRevoked
+	case i.ExpiresAt != nil && !i.ExpiresAt.After(now):
+		return InviteExpired
+	}
+	return InvitePending
+}
+
+// groupsArg maps a section list to a SQL argument: nil => NULL (full access).
+func groupsArg(groups []string) any {
+	if groups == nil {
+		return nil
+	}
+	return groups
+}
+
+// CreateInvite creates (or re-issues, for an email already invited to this
+// tenant) an invite with a fresh token, the given section access and expiry.
+func (s *Store) CreateInvite(ctx context.Context, tenantID, invitedBy uuid.UUID, email, role string, groups []string, expiresAt time.Time) (Invite, error) {
 	email = normalizeEmail(email)
-	inv := Invite{TenantID: tenantID, Email: email, Role: role, Token: RandomToken()}
-	err := s.pool.QueryRow(ctx,
-		`INSERT INTO invites(tenant_id, email, role, token, invited_by)
-		 VALUES($1,$2,$3,$4,$5)
-		 ON CONFLICT (tenant_id, email) DO UPDATE SET role=EXCLUDED.role, token=EXCLUDED.token, accepted_at=NULL
-		 RETURNING id`, tenantID, email, role, inv.Token, invitedBy).Scan(&inv.ID)
-	return inv, err
+	return scanInvite(s.pool.QueryRow(ctx,
+		`INSERT INTO invites(tenant_id, email, role, token, invited_by, allowed_groups, expires_at)
+		 VALUES($1,$2,$3,$4,$5,$6,$7)
+		 ON CONFLICT (tenant_id, email) DO UPDATE SET role=EXCLUDED.role, token=EXCLUDED.token,
+		   accepted_at=NULL, invited_by=EXCLUDED.invited_by, allowed_groups=EXCLUDED.allowed_groups,
+		   expires_at=EXCLUDED.expires_at, revoked_at=NULL
+		 RETURNING `+inviteCols,
+		tenantID, email, role, RandomToken(), invitedBy, groupsArg(groups), expiresAt))
 }
 
 func (s *Store) ListInvites(ctx context.Context, tenantID uuid.UUID) ([]Invite, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, tenant_id, email, role, token, accepted_at IS NOT NULL
-		 FROM invites WHERE tenant_id=$1 ORDER BY created_at DESC`, tenantID)
+		`SELECT `+inviteCols+` FROM invites WHERE tenant_id=$1 ORDER BY created_at DESC`, tenantID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Invite
 	for rows.Next() {
-		var i Invite
-		if err := rows.Scan(&i.ID, &i.TenantID, &i.Email, &i.Role, &i.Token, &i.Accepted); err != nil {
+		i, err := scanInvite(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, i)
@@ -355,23 +412,49 @@ func (s *Store) ListInvites(ctx context.Context, tenantID uuid.UUID) ([]Invite, 
 	return out, rows.Err()
 }
 
-// AcceptInvite consumes a token: creates the user if needed and adds membership.
+// InviteError is a client-facing reason an invite could not be accepted.
+type InviteError struct{ Msg string }
+
+func (e *InviteError) Error() string { return e.Msg }
+
+// AcceptInvite consumes a token: creates the user if needed and adds the
+// membership with the invite's role and section access, all in one
+// transaction. When the token matches an invite but acceptance fails (used,
+// revoked, expired, password missing…), the failure is recorded on the invite
+// after the transaction rolls back and an *InviteError is returned.
 func (s *Store) AcceptInvite(ctx context.Context, token, fullName, pwHash string) (User, Tenant, string, error) {
+	u, t, role, inv, err := s.acceptInvite(ctx, token, fullName, pwHash)
+	var ie *InviteError
+	if errors.As(err, &ie) && inv.ID != uuid.Nil {
+		if rerr := s.recordInviteFailure(ctx, inv.TenantID, inv.ID, ie.Msg); rerr != nil {
+			return User{}, Tenant{}, "", rerr
+		}
+	}
+	return u, t, role, err
+}
+
+func (s *Store) acceptInvite(ctx context.Context, token, fullName, pwHash string) (User, Tenant, string, Invite, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return User{}, Tenant{}, "", err
+		return User{}, Tenant{}, "", Invite{}, err
 	}
 	defer tx.Rollback(ctx)
 
-	var inv Invite
-	err = tx.QueryRow(ctx,
-		`SELECT id, tenant_id, email, role FROM invites WHERE token=$1 AND accepted_at IS NULL`,
-		token).Scan(&inv.ID, &inv.TenantID, &inv.Email, &inv.Role)
+	inv, err := scanInvite(tx.QueryRow(ctx,
+		`SELECT `+inviteCols+` FROM invites WHERE token=$1 FOR UPDATE`, token))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return User{}, Tenant{}, "", errors.New("invalid or already used invite")
+		return User{}, Tenant{}, "", Invite{}, &InviteError{"invalid or already used invite"}
 	}
 	if err != nil {
-		return User{}, Tenant{}, "", err
+		return User{}, Tenant{}, "", Invite{}, err
+	}
+	switch inv.Status {
+	case InviteAccepted:
+		return User{}, Tenant{}, "", inv, &InviteError{"invalid or already used invite"}
+	case InviteRevoked:
+		return User{}, Tenant{}, "", inv, &InviteError{"this invite has been revoked"}
+	case InviteExpired:
+		return User{}, Tenant{}, "", inv, &InviteError{"this invite has expired"}
 	}
 
 	var u User
@@ -379,7 +462,7 @@ func (s *Store) AcceptInvite(ctx context.Context, token, fullName, pwHash string
 	err = tx.QueryRow(ctx, `SELECT id, full_name FROM users WHERE email=$1`, inv.Email).Scan(&u.ID, &u.FullName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if pwHash == "" {
-			return User{}, Tenant{}, "", errors.New("password required for new account")
+			return User{}, Tenant{}, "", inv, &InviteError{"password required for new account"}
 		}
 		err = tx.QueryRow(ctx,
 			`INSERT INTO users(email, password_hash, full_name) VALUES($1,$2,$3) RETURNING id`,
@@ -387,27 +470,69 @@ func (s *Store) AcceptInvite(ctx context.Context, token, fullName, pwHash string
 		u.FullName = fullName
 	}
 	if err != nil {
-		return User{}, Tenant{}, "", err
+		return User{}, Tenant{}, "", inv, err
 	}
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO memberships(tenant_id, user_id, role) VALUES($1,$2,$3)
-		 ON CONFLICT (tenant_id, user_id) DO UPDATE SET role=EXCLUDED.role`,
-		inv.TenantID, u.ID, inv.Role); err != nil {
-		return User{}, Tenant{}, "", err
+	// Re-inviting an existing owner with a lower role must not leave the
+	// organization without an owner.
+	if inv.Role != "owner" {
+		var current string
+		err := tx.QueryRow(ctx,
+			`SELECT role FROM memberships WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE`,
+			inv.TenantID, u.ID).Scan(&current)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return User{}, Tenant{}, "", inv, err
+		}
+		if current == "owner" {
+			if err := ensureOtherOwner(ctx, tx, inv.TenantID, u.ID); errors.Is(err, ErrLastOwner) {
+				return User{}, Tenant{}, "", inv, &InviteError{"accepting would leave the organization without an owner"}
+			} else if err != nil {
+				return User{}, Tenant{}, "", inv, err
+			}
+		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE invites SET accepted_at=now() WHERE id=$1`, inv.ID); err != nil {
-		return User{}, Tenant{}, "", err
+
+	// Section access applies from the first request, including when the user
+	// was already a member (re-invite).
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO memberships(tenant_id, user_id, role, allowed_groups) VALUES($1,$2,$3,$4)
+		 ON CONFLICT (tenant_id, user_id) DO UPDATE SET role=EXCLUDED.role, allowed_groups=EXCLUDED.allowed_groups`,
+		inv.TenantID, u.ID, inv.Role, groupsArg(inv.AllowedGroups)); err != nil {
+		return User{}, Tenant{}, "", inv, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE invites SET accepted_at=now() WHERE id=$1 AND tenant_id=$2`, inv.ID, inv.TenantID); err != nil {
+		return User{}, Tenant{}, "", inv, err
 	}
 
 	var t Tenant
 	if err := tx.QueryRow(ctx, `SELECT id, name, slug FROM tenants WHERE id=$1`, inv.TenantID).Scan(&t.ID, &t.Name, &t.Slug); err != nil {
-		return User{}, Tenant{}, "", err
+		return User{}, Tenant{}, "", inv, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return User{}, Tenant{}, "", err
+		return User{}, Tenant{}, "", inv, err
 	}
-	return u, t, inv.Role, nil
+	return u, t, inv.Role, inv, nil
+}
+
+func (s *Store) recordInviteFailure(ctx context.Context, tenantID, id uuid.UUID, msg string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE invites SET last_error=$3, failed_attempts=failed_attempts+1, last_attempt_at=now()
+		 WHERE id=$1 AND tenant_id=$2`, id, tenantID, msg)
+	return err
+}
+
+// RecordInviteFailureByToken records a failed acceptance that was rejected
+// before the invite was looked up (e.g. a weak password). The token is the
+// invite's unique credential, so it identifies the tenant's row; unknown
+// tokens are ignored.
+func (s *Store) RecordInviteFailureByToken(ctx context.Context, token, msg string) error {
+	if token == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE invites SET last_error=$2, failed_attempts=failed_attempts+1, last_attempt_at=now()
+		 WHERE token=$1`, token, msg)
+	return err
 }
 
 // Members lists users in a tenant (for the team admin page).

@@ -73,6 +73,9 @@ export function FieldInput({
         </select>
       );
     case "ref":
+      if (field.filter_by) {
+        return <FilteredRefInput field={field} value={value} onChange={onChange} disabled={ro} record={record} />;
+      }
       return <RefInput field={field} value={value} onChange={onChange} disabled={ro} />;
     case "lookup":
       if (field.filter_by) {
@@ -160,13 +163,7 @@ function FilteredLookupInput({
       .catch(() => setOpts([]));
   }, [field.ref, field.value_field, field.label_field, field.filter_field, filterVal]);
 
-  if (!filterVal) {
-    return (
-      <select className="select" disabled value="">
-        <option value="">Select department first</option>
-      </select>
-    );
-  }
+  if (!filterVal) return <SiblingFirst field={field} />;
   return (
     <select className="select" disabled={disabled} value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
       <option value="">—</option>
@@ -177,6 +174,48 @@ function FilteredLookupInput({
           {o.label}
         </option>
       ))}
+    </select>
+  );
+}
+
+// FilteredRefInput is the ref counterpart of FilteredLookupInput: options are
+// the target rows whose filter_field equals the record's filter_by sibling
+// (e.g. a document's Contact limited to the chosen Account's contacts).
+function FilteredRefInput({
+  field,
+  value,
+  onChange,
+  disabled,
+  record,
+}: {
+  field: Field;
+  value: any;
+  onChange: (v: any) => void;
+  disabled?: boolean;
+  record?: Record<string, any>;
+}) {
+  const filterVal = field.filter_by ? record?.[field.filter_by] : "";
+  const opts = useRefOptions(filterVal ? field.ref : undefined, field.filter_field, filterVal || undefined);
+  if (!filterVal) return <SiblingFirst field={field} />;
+  return (
+    <select className="select" disabled={disabled} value={value ?? ""} onChange={(e) => onChange(e.target.value)}>
+      <option value="">—</option>
+      {opts.map((o) => (
+        <option key={o.id} value={o.id}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+// SiblingFirst is the disabled placeholder of a dependent field whose sibling
+// isn't chosen yet, e.g. "Select department first".
+function SiblingFirst({ field }: { field: Field }) {
+  const sibling = (field.filter_by || "").replace(/_id$/, "").replace(/_/g, " ");
+  return (
+    <select className="select" disabled value="">
+      <option value="">Select {sibling} first</option>
     </select>
   );
 }

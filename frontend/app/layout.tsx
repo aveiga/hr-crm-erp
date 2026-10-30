@@ -4,7 +4,7 @@ import { AuthProvider } from "@/lib/auth";
 
 export const metadata: Metadata = {
   title: "HR · CRM · ERP",
-  description: "Manage teams, leads, offers and invoices (IGTRs).",
+  description: "Manage teams, leads, offers and service agreements.",
 };
 
 // The browser API base URL is resolved at runtime (not baked at build time) so

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -37,19 +38,21 @@ const (
 		"tenant and your section permissions — you cannot read or write another " +
 		"tenant's data. Start with `describe_schema` to learn the available modules " +
 		"and their fields, then use list_/get_/create_/update_/delete_<module>. " +
-		"Modules with line items (quotes, sales orders, invoices, purchase orders, " +
-		"vendor bills, accounts) use get_doc_/save_doc_<module> which handle the " +
-		"child rows and recompute totals in one transaction."
+		"Modules with line items (quotes, service agreements — module key `invoices` — " +
+		"purchase orders, vendor bills, accounts) use get_doc_/save_doc_<module> which " +
+		"handle the child rows and recompute totals in one transaction. A service " +
+		"agreement's payment_schedule must add up to its grand total; register " +
+		"payments with create_payments (optionally against a schedule_id)."
 )
 
 // convertibleFrom lists the entities that support pipeline conversion. Kept in
 // sync with DocService.Convert (resource/docservice.go); an unlisted key there
 // returns a "cannot be converted" error.
 var convertibleFrom = map[string]bool{
-	"leads":         true,
-	"opportunities": true,
-	"quotes":        true,
-	"sales_orders":  true,
+	"leads":          true,
+	"opportunities":  true,
+	"quotes":         true,
+	"legal_entities": true,
 }
 
 // MCP builds per-request MCP servers backed by the resource engine.
@@ -142,10 +145,18 @@ func (m *MCP) registerEntity(s *mcp.Server, p httpx.Principal, e resource.Entity
 			InputSchema: idSchema(),
 		}, m.del(p, e))
 
+		if m.docs.CanDuplicate(e) {
+			s.AddTool(&mcp.Tool{
+				Name:        "duplicate_" + e.Key,
+				Description: fmt.Sprintf("Copy a %s (header, line items and other child rows) into a new draft.", e.Label),
+				InputSchema: idSchema(),
+			}, m.duplicate(p, e))
+		}
+
 		if convertibleFrom[e.Key] {
 			s.AddTool(&mcp.Tool{
 				Name:        "convert_" + e.Key,
-				Description: fmt.Sprintf("Advance a %s to the next pipeline stage (e.g. quote→sales order→invoice), copying header and lines.", e.Label),
+				Description: fmt.Sprintf("Advance a %s to the next pipeline stage (e.g. quote→sales order→service agreement), copying header and lines.", e.Label),
 				InputSchema: idSchema(),
 			}, m.convert(p, e))
 		}
@@ -220,6 +231,11 @@ func (m *MCP) list(p httpx.Principal, e resource.Entity) mcp.ToolHandler {
 			Desc:     strArg(args, "dir") == "desc",
 			Filters:  map[string]string{},
 		}
+		if raw := strArg(args, "query"); raw != "" {
+			if q, err := url.ParseQuery(raw); err == nil {
+				resource.ParseFilters(e, q, &opt)
+			}
+		}
 		if raw, ok := args["filters"].(map[string]any); ok {
 			for k, v := range raw {
 				opt.Filters[k] = fmt.Sprint(v)
@@ -261,7 +277,15 @@ func (m *MCP) getDoc(p httpx.Principal, e resource.Entity) mcp.ToolHandler {
 		if err != nil {
 			return errResult(err)
 		}
-		return jsonResult(map[string]any{"data": row, "lines": lines})
+		out := map[string]any{"data": row, "lines": lines}
+		children, err := m.docs.LoadChildren(ctx, e, p.TenantID, id)
+		if err != nil {
+			return errResult(err)
+		}
+		if children != nil {
+			out["children"] = children
+		}
+		return jsonResult(out)
 	}
 }
 
@@ -329,18 +353,57 @@ func (m *MCP) saveDoc(p httpx.Principal, e resource.Entity) mcp.ToolHandler {
 				}
 			}
 		}
+		// Secondary child collections (e.g. payment_schedule) are replaced only
+		// when passed, so omitting one keeps the stored rows.
+		var extra map[string][]map[string]any
+		for _, c := range e.Children[1:] {
+			raw, ok := args[c.Entity].([]any)
+			if !ok {
+				continue
+			}
+			if extra == nil {
+				extra = map[string][]map[string]any{}
+			}
+			rows := []map[string]any{}
+			for _, it := range raw {
+				if mrow, ok := it.(map[string]any); ok {
+					rows = append(rows, mrow)
+				}
+			}
+			extra[c.Entity] = rows
+		}
 		header := map[string]any{}
 		for k, v := range args {
 			if k == "id" || k == "lines" {
 				continue
 			}
+			if _, isChild := extra[k]; isChild {
+				continue
+			}
 			header[k] = v
 		}
-		row, err := m.docs.Save(ctx, e, p.TenantID, idPtr, header, lines)
+		row, err := m.docs.SaveDoc(ctx, e, p.TenantID, idPtr, header, lines, extra)
 		if err != nil {
 			return errResult(err)
 		}
 		return jsonResult(map[string]any{"data": row})
+	}
+}
+
+func (m *MCP) duplicate(p httpx.Principal, e resource.Entity) mcp.ToolHandler {
+	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if !p.CanWrite() {
+			return errResult(httpx.ErrForbidden)
+		}
+		id, err := idArg(req)
+		if err != nil {
+			return errResult(err)
+		}
+		row, err := m.docs.Duplicate(ctx, e, p.TenantID, id)
+		if err != nil {
+			return errResult(err)
+		}
+		return jsonResult(map[string]any{"entity": e.Key, "data": row})
 	}
 }
 
@@ -474,10 +537,24 @@ func listSchema(e resource.Entity) map[string]any {
 		"dir":       {"type": "string", "enum": []string{"asc", "desc"}},
 		"filters": {
 			"type":        "object",
-			"description": "equality filters keyed by field",
+			"description": "equality filters keyed by field (\"@empty\" matches blank)",
 			"properties":  filterProps,
 		},
+		"query": {"type": "string", "description": queryHelp(e)},
 	}, nil)
+}
+
+// queryHelp documents the advanced filter string, listing the entity's views.
+func queryHelp(e resource.Entity) string {
+	h := "advanced filters as a query string: f_<field>=v (equals; @empty), fin_<field>=a,b (any of), " +
+		"fmin_/fmax_<field>=v (inclusive range on dates/numbers). Date tokens: @today, @today+N, @today-N, @month."
+	if len(e.Views) > 0 {
+		h += " Saved views:"
+		for _, v := range e.Views {
+			h += fmt.Sprintf(" %q = %s;", v.Label, v.Query)
+		}
+	}
+	return h
 }
 
 // writeSchema builds the create/update argument schema from an entity's fields.
@@ -520,6 +597,23 @@ func saveDocSchema(reg *resource.Registry, e resource.Entity) map[string]any {
 			props["lines"] = map[string]any{
 				"type":        "array",
 				"description": e.Children[0].Label + " — replaces the existing line items",
+				"items":       map[string]any{"type": "object", "properties": itemProps},
+			}
+		}
+		for _, c := range e.Children[1:] {
+			child, ok := reg.Get(c.Entity)
+			if !ok {
+				continue
+			}
+			itemProps := map[string]any{}
+			for _, f := range child.Fields {
+				if f.Key != c.FK {
+					itemProps[f.Key] = fieldSchema(f)
+				}
+			}
+			props[c.Entity] = map[string]any{
+				"type":        "array",
+				"description": c.Label + " — when given, replaces the existing rows; omit to keep them",
 				"items":       map[string]any{"type": "object", "properties": itemProps},
 			}
 		}

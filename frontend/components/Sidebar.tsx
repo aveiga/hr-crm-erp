@@ -7,7 +7,7 @@ import { Icon } from "./Icon";
 import { useAuth, isAdmin } from "@/lib/auth";
 import type { Entity } from "@/lib/types";
 
-const GROUP_ORDER = ["Master", "HR", "CRM", "ERP", "AP", "SAR"];
+const GROUP_ORDER = ["Master", "HR", "CRM", "ERP", "Azure", "AP"];
 
 export function Sidebar() {
   const { entities } = useMeta();
@@ -28,12 +28,23 @@ export function Sidebar() {
     <aside className="w-60 shrink-0 border-r border-slate-200 bg-white h-screen sticky top-0 overflow-y-auto">
       <div className="px-4 py-4 border-b border-slate-200">
         <div className="font-semibold text-brand-700">HR · CRM · ERP</div>
-        <div className="text-xs text-slate-400">Teams · Leads · Offers · IGTRs</div>
+        <div className="text-xs text-slate-400">Teams · Leads · Offers · Service Agreements</div>
       </div>
       <nav className="p-2 text-sm">
         <NavLink href="/dashboard" active={pathname === "/dashboard"} icon="layout-dashboard">
           Dashboard
         </NavLink>
+        {/* Sales reporting covers quotes / agreements / payments (ERP). */}
+        {entities.some((e) => ["quotes", "invoices", "payments"].includes(e.key)) && (
+          <NavLink href="/reports" active={pathname.startsWith("/reports")} icon="chart-column">
+            Reports
+          </NavLink>
+        )}
+        {entities.some((e) => e.key === "azure_subscriptions") && (
+          <NavLink href="/azure" active={pathname.startsWith("/azure")} icon="cloud">
+            Azure Dashboard
+          </NavLink>
+        )}
 
         {groupKeys.map((g) => (
           <div key={g} className="mt-3">
@@ -58,6 +69,9 @@ export function Sidebar() {
             <div className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
               Settings
             </div>
+            <NavLink href="/users" active={pathname.startsWith("/users")} icon="users">
+              Users
+            </NavLink>
             <NavLink href="/team" active={pathname.startsWith("/team")} icon="user-cog">
               Team
             </NavLink>

@@ -48,6 +48,12 @@ boot — but ordering matters: `db.Migrate` runs **before** `EnsureSchema` in
 `main.go`. If your index depends on a generated column, either move the index
 into `EnsureSchema` or guard with `IF EXISTS`/create the column there first.
 
+**Data backfills that touch entity columns** go in
+`internal/db/datamigrations/NNNN_name.sql` instead: `db.MigrateData` applies
+them once each *after* `EnsureSchema` (from `server.New`), so newly added
+catalog columns exist. Guard references to retired entity tables with
+`to_regclass('ent_x') IS NOT NULL` (fresh databases never create them).
+
 ## Reset the database
 
 ```bash

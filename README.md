@@ -240,7 +240,10 @@ image runs in any environment without a rebuild.
 Required production env:
 
 - **Backend**: `DATABASE_URL`, `JWT_SECRET` (mandatory), `CORS_ORIGIN` (must
-  match the frontend's public origin), `REDIS_URL` (optional).
+  match the frontend's public origin), `REDIS_URL` (optional), `SECRETS_KEY`
+  (encrypts stored Azure client secrets; defaults to `JWT_SECRET`),
+  `AZURE_SYNC_EVERY` (default `24h`, `0` disables). Azure setup:
+  [docs/azure-setup.md](docs/azure-setup.md).
 - **Frontend**: `API_URL` (the backend's public URL).
 
 See `.env.example`.

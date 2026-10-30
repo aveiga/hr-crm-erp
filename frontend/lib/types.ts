@@ -27,9 +27,20 @@ export interface Field {
   filter_field?: string; // target field matched against the sibling value
   option_filter_field?: string; // target field matched against a constant
   option_filter_value?: string; // constant value for the static option filter
+  fill_from?: string; // sibling ref; while set, this field mirrors the ref'd row's fill_field (read-only)
+  fill_field?: string;
+  disabled_when?: string; // sibling field; when it equals disabled_value this field is disabled + cleared
+  disabled_value?: string;
+  default?: string; // pre-filled on new records
   read_only?: boolean;
   in_list?: boolean;
   help?: string;
+}
+
+// A saved list filter (query uses the list endpoint's filter params).
+export interface View {
+  label: string;
+  query: string;
 }
 
 export interface Child {
@@ -48,6 +59,8 @@ export interface Entity {
   hidden?: boolean;
   read_only?: boolean;
   children?: Child[];
+  views?: View[];
+  columns?: string[]; // list view columns, in order (else first in-list fields + totals)
   fields: Field[];
 }
 
@@ -85,4 +98,49 @@ export interface ListResult {
   total: number;
   page: number;
   page_size: number;
+}
+
+// --- User manager (/users) --------------------------------------------------
+
+export type Role = "owner" | "admin" | "member" | "viewer";
+
+// TeamUser is a member row from GET /api/v1/team/users.
+export interface TeamUser {
+  user_id: string;
+  email: string;
+  full_name: string;
+  role: Role;
+  allowed_groups: string[] | null; // null => all sections
+  joined_at: string;
+  last_login_at: string | null;
+  // false when the user also belongs to another organization: their email,
+  // name and password can then only be changed by themselves.
+  identity_editable: boolean;
+}
+
+export type InviteStatus = "pending" | "accepted" | "expired" | "revoked";
+
+export interface TeamInvite {
+  id: string;
+  tenant_id: string;
+  email: string;
+  role: Role;
+  token: string;
+  accepted: boolean;
+  allowed_groups: string[] | null;
+  status: InviteStatus;
+  created_at: string;
+  expires_at: string | null; // null => never expires
+  accepted_at: string | null;
+  revoked_at: string | null;
+  last_error: string | null;
+  failed_attempts: number;
+  last_attempt_at: string | null;
+}
+
+export interface PasswordResetLink {
+  user_id: string;
+  token: string;
+  path: string; // e.g. /reset-password?token=…
+  expires_at: string;
 }

@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"hrcrm/internal/httpx"
 )
@@ -20,14 +22,35 @@ import (
 // derived fields (e.g. an invoice's legal entity name/address), and converts
 // one document type into the next without re-entering data.
 type DocService struct {
-	reg  *Registry
-	repo *Repo
-	pool *pgxpool.Pool
+	reg       *Registry
+	repo      *Repo
+	pool      *pgxpool.Pool
+	saveHooks map[string]func(ctx context.Context, tenantID uuid.UUID, header map[string]any)
 }
 
 func NewDocService(reg *Registry, repo *Repo) *DocService {
-	return &DocService{reg: reg, repo: repo, pool: repo.pool}
+	s := &DocService{reg: reg, repo: repo, pool: repo.pool}
+	repo.WithRegistry(reg)
+	s.registerPaymentHooks()
+	s.registerLeadHooks()
+	return s
 }
+
+// OnSave registers a callback run after a document of the entity is saved
+// (committed), with its stored header — for modules outside this package that
+// keep other records in step (e.g. an Azure invoice trues up its agreement).
+func (s *DocService) OnSave(entityKey string, fn func(ctx context.Context, tenantID uuid.UUID, header map[string]any)) {
+	if s.saveHooks == nil {
+		s.saveHooks = map[string]func(context.Context, uuid.UUID, map[string]any){}
+	}
+	s.saveHooks[entityKey] = fn
+}
+
+// Repo exposes the generic repository (for modules built on the engine).
+func (s *DocService) Repo() *Repo { return s.repo }
+
+// Registry exposes the entity registry.
+func (s *DocService) Registry() *Registry { return s.reg }
 
 // IsDocument reports whether an entity has line items (is a header document).
 func (e Entity) IsDocument() bool { return len(e.Children) > 0 }
@@ -35,6 +58,21 @@ func (e Entity) IsDocument() bool { return len(e.Children) > 0 }
 // Save upserts a document header together with its line items in one
 // transaction. id == nil creates a new document.
 func (s *DocService) Save(ctx context.Context, e Entity, tenantID uuid.UUID, id *uuid.UUID, header map[string]any, lines []map[string]any) (map[string]any, error) {
+	return s.SaveDoc(ctx, e, tenantID, id, header, lines, nil)
+}
+
+// SaveDoc is Save plus the document's secondary child collections (every
+// Children entry after the first, e.g. a service agreement's invoicing
+// schedule), keyed by child entity. The primary children (lines) are always
+// replaced, as before; a secondary collection is only replaced when its key is
+// present in extra, so clients that don't know about it never wipe it.
+func (s *DocService) SaveDoc(ctx context.Context, e Entity, tenantID uuid.UUID, id *uuid.UUID, header map[string]any, lines []map[string]any, extra map[string][]map[string]any) (map[string]any, error) {
+	return s.save(ctx, e, tenantID, id, header, lines, extra, nil)
+}
+
+// save is SaveDoc plus system values: read-only columns written before
+// derivation (e.g. the quote a service agreement was created from).
+func (s *DocService) save(ctx context.Context, e Entity, tenantID uuid.UUID, id *uuid.UUID, header map[string]any, lines []map[string]any, extra map[string][]map[string]any, system map[string]any) (map[string]any, error) {
 	if !e.IsDocument() {
 		return nil, httpx.Errorf(http.StatusBadRequest, "not_document", e.Label+" is not a line-item document")
 	}
@@ -53,6 +91,8 @@ func (s *DocService) Save(ctx context.Context, e Entity, tenantID uuid.UUID, id 
 	// Upsert header (writable fields only; computed/derived set below).
 	var pid uuid.UUID
 	if id == nil {
+		header = copyMap(header)
+		applyDefaults(e, header)
 		pid, err = s.insertHeader(ctx, tx, e, tenantID, header)
 	} else {
 		pid = *id
@@ -62,20 +102,66 @@ func (s *DocService) Save(ctx context.Context, e Entity, tenantID uuid.UUID, id 
 		return nil, err
 	}
 
-	// Derived fields (e.g. invoice legal entity name/address from the chosen
-	// legal entity) and computed money totals are system-managed.
-	derived := s.deriveFields(ctx, tx, e, tenantID, header)
+	// Derivations and totals work on the stored row (header merged over what
+	// was already saved), so a partial update can't skew them.
+	if err := s.setColumns(ctx, tx, e, tenantID, pid, system); err != nil {
+		return nil, err
+	}
+	current, err := s.getTx(ctx, tx, e, tenantID, pid)
+	if err != nil {
+		return nil, err
+	}
+
+	// Field rules (mirrored / conditionally cleared fields), as on generic writes.
+	rules := ruleValues(e, current, func(k string, ref any) map[string]any { return s.refRow(ctx, tx, k, tenantID, ref) })
+	if err := s.setColumns(ctx, tx, e, tenantID, pid, rules); err != nil {
+		return nil, err
+	}
+	for k, v := range rules {
+		current[k] = v
+	}
+
+	// Derived fields (e.g. seller/buyer snapshots, upstream links) and computed
+	// money totals are system-managed.
+	derived := s.deriveFields(ctx, tx, e, tenantID, current)
 	if err := s.setColumns(ctx, tx, e, tenantID, pid, derived); err != nil {
 		return nil, err
+	}
+	for k, v := range derived {
+		current[k] = v
 	}
 
 	if err := s.replaceChildren(ctx, tx, child, tenantID, fk, pid, lines); err != nil {
 		return nil, err
 	}
+	if e.Key == "accounts" {
+		if err := syncContactEntity(ctx, tx, s.reg, tenantID, pid.String()); err != nil {
+			return nil, err
+		}
+	}
 
-	totals := ComputeTotals(e, header, lines)
+	totals := ComputeTotals(e, current, lines)
 	if err := s.setColumns(ctx, tx, e, tenantID, pid, totals); err != nil {
 		return nil, err
+	}
+
+	for _, c := range e.Children[1:] {
+		rows, present := extra[c.Entity]
+		if !present {
+			continue
+		}
+		ce, ok := s.reg.Get(c.Entity)
+		if !ok {
+			return nil, fmt.Errorf("child entity %s missing", c.Entity)
+		}
+		if ce.Key == "payment_schedule" {
+			if rows, err = prepareSchedule(rows, toFloat64(totals["grand_total"])); err != nil {
+				return nil, err
+			}
+		}
+		if err := s.replaceChildren(ctx, tx, ce, tenantID, c.FK, pid, rows); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -85,7 +171,17 @@ func (s *DocService) Save(ctx context.Context, e Entity, tenantID uuid.UUID, id 
 	// Keep the linked opportunity's pipeline value in sync with the quote it
 	// spawned, so the CRM forecast reflects the real numbers.
 	if e.Key == "quotes" {
-		s.syncOpportunityAmount(ctx, tenantID, header, totals)
+		s.syncOpportunityAmount(ctx, tenantID, current, totals)
+	}
+	if fn, ok := s.saveHooks[e.Key]; ok {
+		fn(ctx, tenantID, current)
+	}
+	if e.Key == "invoices" {
+		// Payment position (schedule vs payments) and the quote's agreement status.
+		if err := s.recomputeAgreement(ctx, tenantID, pid); err != nil {
+			return nil, err
+		}
+		s.syncQuoteAgreementStatus(ctx, tenantID, current["quote_id"])
 	}
 	return s.repo.Get(ctx, e, tenantID, pid)
 }
@@ -137,6 +233,30 @@ func (s *DocService) LoadLines(ctx context.Context, parent Entity, tenantID, par
 	return res.Data, nil
 }
 
+// LoadChildren returns a document's secondary child collections (Children
+// after the first), keyed by child entity. Nil when there are none.
+func (s *DocService) LoadChildren(ctx context.Context, parent Entity, tenantID, parentID uuid.UUID) (map[string][]map[string]any, error) {
+	if len(parent.Children) < 2 {
+		return nil, nil
+	}
+	out := map[string][]map[string]any{}
+	for _, c := range parent.Children[1:] {
+		ce, ok := s.reg.Get(c.Entity)
+		if !ok {
+			continue
+		}
+		res, err := s.repo.List(ctx, ce, tenantID, ListOptions{
+			Page: 1, PageSize: 200, Sort: "line_no",
+			Filters: map[string]string{c.FK: parentID.String()},
+		})
+		if err != nil {
+			return nil, err
+		}
+		out[c.Entity] = res.Data
+	}
+	return out, nil
+}
+
 // --- conversions -----------------------------------------------------------
 
 // Convert advances a record to the next stage of the pipeline, carrying the
@@ -162,43 +282,33 @@ func (s *DocService) Convert(ctx context.Context, p httpx.Principal, fromKey str
 		}
 		return s.convertOpportunity(ctx, tenantID, sourceID)
 	case "quotes":
-		if err := s.requireGroup(p, "sales_orders"); err != nil {
-			return "", nil, err
-		}
-		return s.convert(ctx, "quotes", "sales_orders", tenantID, sourceID, func(src map[string]any) map[string]any {
-			return map[string]any{
-				"legal_entity_id":    src["legal_entity_id"],
-				"account_id":         src["account_id"],
-				"currency":           src["currency"],
-				"vat_pct":            src["vat_pct"],
-				"markup_pct":         src["markup_pct"],
-				"payment_terms_days": src["payment_terms_days"],
-				"quote_description":  src["description"],
-				"quote_id":           fmt.Sprint(src["id"]),
-				"order_date":         today(),
-				"status":             "Open",
-			}
-		})
-	case "sales_orders":
+		// Sales Orders were retired: a quote converts straight into a service
+		// agreement, which keeps a read-only link back to it.
 		if err := s.requireGroup(p, "invoices"); err != nil {
 			return "", nil, err
 		}
-		return s.convert(ctx, "sales_orders", "invoices", tenantID, sourceID, func(src map[string]any) map[string]any {
+		return s.convert(ctx, "quotes", "invoices", tenantID, sourceID, func(src map[string]any) (map[string]any, map[string]any) {
 			terms := toInt64(src["payment_terms_days"])
 			return map[string]any{
 				"legal_entity_id":    src["legal_entity_id"],
 				"account_id":         src["account_id"],
-				"currency":           src["currency"],
 				"vat_pct":            src["vat_pct"],
 				"markup_pct":         src["markup_pct"],
 				"payment_terms_days": src["payment_terms_days"],
-				"quote_description":  src["quote_description"],
-				"sales_order_id":     fmt.Sprint(src["id"]),
+				"contact_id":         src["contact_id"],
+				"service_start_date": src["service_start_date"],
+				"service_end_date":   src["service_end_date"],
+				"quote_description":  src["description"],
 				"invoice_date":       today(),
 				"due_date":           todayPlus(terms),
 				"status":             "Draft",
-			}
+			}, map[string]any{"quote_id": fmt.Sprint(src["id"])}
 		})
+	case "legal_entities":
+		if err := s.requireGroup(p, "accounts"); err != nil {
+			return "", nil, err
+		}
+		return s.convertLegalEntity(ctx, tenantID, sourceID)
 	default:
 		return "", nil, httpx.Errorf(http.StatusBadRequest, "bad_convert", "this record type cannot be converted")
 	}
@@ -252,7 +362,7 @@ func (s *DocService) convertLead(ctx context.Context, tenantID, sourceID uuid.UU
 	// Reuse an account with the same name if one exists, merging the lead's
 	// contact into it; otherwise create the account with the contact inline.
 	var accountID string
-	existingID, found, err := s.findAccountByName(ctx, tenantID, asStr(src["company"]))
+	existingID, found, err := s.findAccount(ctx, tenantID, asStr(src["legal_entity_id"]), asStr(src["company"]))
 	if err != nil {
 		return "", nil, err
 	}
@@ -269,14 +379,15 @@ func (s *DocService) convertLead(ctx context.Context, tenantID, sourceID uuid.UU
 			contacts = append(contacts, contact)
 		}
 		account, err := s.Save(ctx, accounts, tenantID, nil, map[string]any{
-			"account_name": src["company"],
-			"type":         "Prospect",
-			"country":      src["country"],
-			"phone":        src["phone"],
-			"email":        src["email"],
-			"owner":        src["owner"],
-			"created_date": today(),
-			"notes":        src["notes"],
+			"account_name":     src["company"],
+			"buying_entity_id": src["legal_entity_id"],
+			"type":             "Prospect",
+			"country":          src["country"],
+			"phone":            src["phone"],
+			"email":            src["email"],
+			"owner":            src["owner"],
+			"created_date":     today(),
+			"notes":            src["notes"],
 		}, contacts)
 		if err != nil {
 			return "", nil, err
@@ -311,10 +422,12 @@ func (s *DocService) convertLead(ctx context.Context, tenantID, sourceID uuid.UU
 	return "opportunities", opp, nil
 }
 
-// findAccountByName looks up a tenant's account by a case-insensitive name
-// match, returning the earliest-created one when several share a name.
-func (s *DocService) findAccountByName(ctx context.Context, tenantID uuid.UUID, name string) (uuid.UUID, bool, error) {
-	if strings.TrimSpace(name) == "" {
+// findAccount looks up a tenant's account for a lead: preferably one whose
+// buying entity is the lead's legal entity, else a case-insensitive name
+// match. The earliest-created one wins when several match.
+func (s *DocService) findAccount(ctx context.Context, tenantID uuid.UUID, entityID, name string) (uuid.UUID, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" && entityID == "" {
 		return uuid.Nil, false, nil
 	}
 	accounts, ok := s.reg.Get("accounts")
@@ -323,8 +436,10 @@ func (s *DocService) findAccountByName(ctx context.Context, tenantID uuid.UUID, 
 	}
 	var id uuid.UUID
 	err := s.pool.QueryRow(ctx,
-		fmt.Sprintf("SELECT id FROM %s WHERE tenant_id=$1 AND lower(account_name)=lower($2) ORDER BY created_at LIMIT 1", accounts.Table()),
-		tenantID, name).Scan(&id)
+		fmt.Sprintf(`SELECT id FROM %s WHERE tenant_id=$1
+			AND (($2 <> '' AND buying_entity_id=$2) OR ($3 <> '' AND lower(account_name)=lower($3)))
+			ORDER BY ($2 <> '' AND buying_entity_id=$2) DESC, created_at LIMIT 1`, accounts.Table()),
+		tenantID, entityID, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
 	}
@@ -367,8 +482,52 @@ func (s *DocService) mergeContact(ctx context.Context, tenantID, accountID uuid.
 	for k, v := range contact {
 		input[k] = v
 	}
-	_, err = s.repo.Create(ctx, contacts, tenantID, input)
+	if _, err = s.repo.Create(ctx, contacts, tenantID, input); err != nil {
+		return err
+	}
+	return syncContactEntity(ctx, s.pool, s.reg, tenantID, accountID.String())
+}
+
+// execer is satisfied by both the pool and a transaction.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// syncContactEntity stamps an account's contacts with the account's buying
+// entity, so a lead for that company can offer them (Lead → Contact).
+func syncContactEntity(ctx context.Context, db execer, reg *Registry, tenantID uuid.UUID, accountID string) error {
+	accounts, ok1 := reg.Get("accounts")
+	contacts, ok2 := reg.Get("contacts")
+	if !ok1 || !ok2 {
+		return nil
+	}
+	_, err := db.Exec(ctx, fmt.Sprintf(`UPDATE %s c SET buying_entity_id = a.buying_entity_id
+		FROM %s a WHERE a.tenant_id=$1 AND a.id::text=$2 AND c.tenant_id=$1 AND c.account_id=$2
+		AND c.buying_entity_id IS DISTINCT FROM a.buying_entity_id`, contacts.Table(), accounts.Table()), tenantID, accountID)
 	return err
+}
+
+// registerLeadHooks fills a lead's contact details from the picked Contact
+// (only the details left blank, so typed values win).
+func (s *DocService) registerLeadHooks() {
+	s.repo.Hook("leads", WriteHooks{Before: func(ctx context.Context, tenantID uuid.UUID, row map[string]any) (map[string]any, error) {
+		out := map[string]any{}
+		if asStr(row["contact_id"]) == "" {
+			return out, nil
+		}
+		c := s.repo.poolLoader(ctx, tenantID)("contacts", row["contact_id"])
+		if c == nil {
+			return out, nil
+		}
+		for leadKey, contactKey := range map[string]string{
+			"contact_first_name": "first_name", "contact_last_name": "last_name", "email": "email", "phone": "phone",
+		} {
+			if isEmpty(row[leadKey]) && !isEmpty(c[contactKey]) {
+				out[leadKey] = c[contactKey]
+			}
+		}
+		return out, nil
+	}})
 }
 
 // contactFullName is a lowercased "first last" key for matching contacts that
@@ -393,24 +552,13 @@ func (s *DocService) convertOpportunity(ctx context.Context, tenantID, sourceID 
 
 	header := map[string]any{
 		"account_id":     src["account_id"],
+		"contact_id":     src["contact_id"],
 		"opportunity_id": fmt.Sprint(src["id"]),
 		"description":    src["opportunity_name"],
 		"quote_date":     today(),
 		"status":         "Draft",
 	}
-	// Default the quote's legal entity to the account's billing entity.
-	if accID := asStr(src["account_id"]); accID != "" {
-		if accounts, ok := s.reg.Get("accounts"); ok {
-			if id, err := uuid.Parse(accID); err == nil {
-				if acc, err := s.repo.Get(ctx, accounts, tenantID, id); err == nil {
-					if le := acc["legal_entity_id"]; le != nil {
-						header["legal_entity_id"] = le
-					}
-				}
-			}
-		}
-	}
-
+	// The seller legal entity defaults from the account in deriveFields.
 	quotes, ok := s.reg.Get("quotes")
 	if !ok {
 		return "", nil, fmt.Errorf("entity quotes missing")
@@ -422,7 +570,7 @@ func (s *DocService) convertOpportunity(ctx context.Context, tenantID, sourceID 
 	return "quotes", created, nil
 }
 
-func (s *DocService) convert(ctx context.Context, fromKey, toKey string, tenantID, sourceID uuid.UUID, mapHeader func(map[string]any) map[string]any) (string, map[string]any, error) {
+func (s *DocService) convert(ctx context.Context, fromKey, toKey string, tenantID, sourceID uuid.UUID, mapHeader func(map[string]any) (header, system map[string]any)) (string, map[string]any, error) {
 	from, ok := s.reg.Get(fromKey)
 	if !ok {
 		return "", nil, fmt.Errorf("entity %s missing", fromKey)
@@ -448,11 +596,50 @@ func (s *DocService) convert(ctx context.Context, fromKey, toKey string, tenantI
 			"unit_price":  l["unit_price"],
 		})
 	}
-	created, err := s.Save(ctx, to, tenantID, nil, mapHeader(src), lines)
+	header, system := mapHeader(src)
+	created, err := s.save(ctx, to, tenantID, nil, header, lines, nil, system)
 	if err != nil {
 		return "", nil, err
 	}
 	return toKey, created, nil
+}
+
+// convertLegalEntity opens a customer Account for a legal entity: the account
+// takes the entity's name and links it as its buying entity (so the buyer
+// details mirror it). An entity already linked to an account isn't converted
+// twice.
+func (s *DocService) convertLegalEntity(ctx context.Context, tenantID, sourceID uuid.UUID) (string, map[string]any, error) {
+	les, ok := s.reg.Get("legal_entities")
+	if !ok {
+		return "", nil, fmt.Errorf("entity legal_entities missing")
+	}
+	src, err := s.repo.Get(ctx, les, tenantID, sourceID)
+	if err != nil {
+		return "", nil, err
+	}
+	accounts, ok := s.reg.Get("accounts")
+	if !ok {
+		return "", nil, fmt.Errorf("entity accounts missing")
+	}
+	existing, err := s.repo.List(ctx, accounts, tenantID, ListOptions{
+		Page: 1, PageSize: 1, Filters: map[string]string{"buying_entity_id": sourceID.String()},
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if existing.Total > 0 {
+		return "", nil, httpx.Errorf(http.StatusConflict, "already_converted", "an account already uses this legal entity as its buying entity")
+	}
+	account, err := s.Save(ctx, accounts, tenantID, nil, map[string]any{
+		"account_name":     src["legal_name"],
+		"type":             "Customer",
+		"buying_entity_id": sourceID.String(),
+		"created_date":     today(),
+	}, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	return "accounts", account, nil
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -566,6 +753,13 @@ func (s *DocService) replaceChildren(ctx context.Context, tx pgx.Tx, child Entit
 		cols := []string{"tenant_id", quoteIdent(fk)}
 		args := []any{tenantID, parentID.String()}
 		n := 3
+		// Keep a row's id across saves so references to it survive (e.g. a
+		// payment's installment, a quote's contact).
+		if rid, err := uuid.Parse(asStr(row["id"])); err == nil {
+			cols = append(cols, "id")
+			args = append(args, rid)
+			n++
+		}
 		add := func(col string, val any) {
 			cols = append(cols, quoteIdent(col))
 			args = append(args, val)
@@ -579,6 +773,8 @@ func (s *DocService) replaceChildren(ctx context.Context, tx pgx.Tx, child Entit
 				add("line_no", seq)
 			case f.Key == "line_net" && hasLineNet:
 				add("line_net", toFloat64(row["qty"])*toFloat64(row["unit_price"]))
+			case f.Key == "label" && child.Key == "payment_schedule":
+				add("label", asStr(row["label"])) // computed by prepareSchedule
 			case f.ReadOnly:
 				continue // other computed fields are system-managed
 			default:
@@ -621,29 +817,123 @@ func childRowEmpty(child Entity, fk string, row map[string]any) bool {
 	return true
 }
 
-// deriveFields computes system-filled, read-only fields from the header's refs.
-func (s *DocService) deriveFields(ctx context.Context, tx pgx.Tx, e Entity, tenantID uuid.UUID, header map[string]any) map[string]any {
+// deriveFields computes system-filled fields from a document's stored row:
+//
+//   - the seller legal entity defaults to the account's billing legal entity;
+//   - seller and buyer snapshots (name, address, VAT, billing email) so a
+//     document keeps the parties as they were when it was saved;
+//   - upstream links (opportunity / quote) inherited from the parent document,
+//     so the quote → sales order → service agreement chain stays navigable.
+//
+// Lookups are tolerant: a missing or foreign reference derives nothing.
+func (s *DocService) deriveFields(ctx context.Context, tx pgx.Tx, e Entity, tenantID uuid.UUID, row map[string]any) map[string]any {
 	out := map[string]any{}
-	// Invoices: copy the chosen legal entity's name + address onto the invoice.
-	if _, ok := e.field("legal_entity_name"); ok {
-		if leID := asStr(header["legal_entity_id"]); leID != "" {
-			if le, ok := s.reg.Get("legal_entities"); ok {
-				if id, err := uuid.Parse(leID); err == nil {
-					var name, addr *string
-					_ = tx.QueryRow(ctx,
-						fmt.Sprintf("SELECT legal_name, billing_address FROM %s WHERE tenant_id=$1 AND id=$2", le.Table()),
-						tenantID, id).Scan(&name, &addr)
-					if name != nil {
-						out["legal_entity_name"] = *name
-					}
-					if _, ok := e.field("legal_entity_billing_address"); ok && addr != nil {
-						out["legal_entity_billing_address"] = *addr
-					}
-				}
+	has := func(k string) bool { _, ok := e.field(k); return ok }
+
+	if has("buyer_name") {
+		if account := s.refRow(ctx, tx, "accounts", tenantID, row["account_id"]); account != nil {
+			if asStr(row["legal_entity_id"]) == "" && asStr(account["legal_entity_id"]) != "" {
+				out["legal_entity_id"] = account["legal_entity_id"]
 			}
+			out["buyer_name"] = firstNonEmpty(asStr(account["legal_entity_name"]), asStr(account["account_name"]))
+			out["buyer_address"] = nilIfEmpty(asStr(account["legal_entity_address"]))
+			out["buyer_vat_id"] = nilIfEmpty(asStr(account["vat_id"]))
+			out["buyer_billing_email"] = nilIfEmpty(firstNonEmpty(asStr(account["billing_email"]), asStr(account["email"])))
+		}
+	}
+
+	// Seller snapshot. Keyed on legal_entity_billing_address, which only sales
+	// documents have: an account's legal_entity_name is the *buyer's* name and
+	// must never be overwritten with our seller entity's.
+	if has("legal_entity_billing_address") {
+		leID := row["legal_entity_id"]
+		if v, ok := out["legal_entity_id"]; ok {
+			leID = v
+		}
+		if le := s.refRow(ctx, tx, "legal_entities", tenantID, leID); le != nil {
+			out["legal_entity_name"] = le["legal_name"]
+			out["legal_entity_billing_address"] = le["billing_address"]
+		}
+	}
+
+	// Upstream link: a service agreement inherits its quote's opportunity.
+	quote := s.refRow(ctx, tx, "quotes", tenantID, row["quote_id"])
+	if e.Key != "quotes" && has("opportunity_id") && quote != nil && asStr(quote["opportunity_id"]) != "" {
+		out["opportunity_id"] = quote["opportunity_id"]
+	}
+
+	// Currency: an agreement takes its quote's; otherwise the account's
+	// currency, else the seller's default. Left as stored when none is known.
+	if has("buyer_name") && has("currency") {
+		cur := ""
+		if e.Key != "quotes" && quote != nil {
+			cur = asStr(quote["currency"])
+		}
+		if cur == "" {
+			cur = asStr(s.refRow(ctx, tx, "accounts", tenantID, row["account_id"])["currency"])
+		}
+		if cur == "" {
+			leID := row["legal_entity_id"]
+			if v, ok := out["legal_entity_id"]; ok {
+				leID = v
+			}
+			cur = asStr(s.refRow(ctx, tx, "legal_entities", tenantID, leID)["default_currency"])
+		}
+		if cur != "" {
+			out["currency"] = cur
 		}
 	}
 	return out
+}
+
+// refRow loads the row a reference value points at, or nil.
+func (s *DocService) refRow(ctx context.Context, tx pgx.Tx, entityKey string, tenantID uuid.UUID, ref any) map[string]any {
+	id, err := uuid.Parse(asStr(ref))
+	if err != nil {
+		return nil
+	}
+	e, ok := s.reg.Get(entityKey)
+	if !ok {
+		return nil
+	}
+	row, err := s.getTx(ctx, tx, e, tenantID, id)
+	if err != nil {
+		return nil
+	}
+	return row
+}
+
+// getTx is Repo.Get inside a transaction.
+func (s *DocService) getTx(ctx context.Context, tx pgx.Tx, e Entity, tenantID, id uuid.UUID) (map[string]any, error) {
+	rows, err := tx.Query(ctx, fmt.Sprintf("SELECT %s FROM %s WHERE tenant_id=$1 AND id=$2", selectCols(e), e.Table()), tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	data, err := scanRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, httpx.ErrNotFound
+	}
+	return data[0], nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func nilIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // ComputeTotals derives net/markup/VAT/grand (and balance) from line items and
@@ -677,7 +967,15 @@ func ComputeTotals(e Entity, header map[string]any, lines []map[string]any) map[
 	return out
 }
 
-func round2(v float64) float64 { return float64(int64(v*100+0.5)) / 100 }
+func round2(v float64) float64 { return math.Round(v*100) / 100 }
+
+func copyMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
 
 func toFloat64(v any) float64 {
 	switch n := v.(type) {

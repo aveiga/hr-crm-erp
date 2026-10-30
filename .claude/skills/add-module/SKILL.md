@@ -41,8 +41,9 @@ automatically generates:
 
 3. Choose a unique `Key` (lowercase, snake_case — it becomes the URL and table
    suffix). `Icon` is any [lucide](https://lucide.dev/icons) icon name in kebab
-   case. `Group` controls sidebar grouping (existing: Master, HR, CRM, ERP, AP,
-   SAR).
+   case. `Group` controls sidebar grouping (existing: Master, HR, CRM, ERP, AP).
+   Optional: `Views` (saved list filters), `Columns` (list columns), and field
+   rules `filledFrom` / `disabledWhen` / `withDefault` (see CLAUDE.md).
 4. Restart the backend (`go run ./cmd/server`). On boot, `EnsureSchema` creates
    the table and adds any new columns via `ADD COLUMN IF NOT EXISTS` — existing
    data is preserved.
